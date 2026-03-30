@@ -11,9 +11,106 @@ import ssl
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 import certifi
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None  # type: ignore[misc, assignment]
+
+_AGENT_DIR = Path(__file__).resolve().parent
+
+
+def _read_env_file_as_text(path: Path) -> str:
+    """UTF-8 / UTF-16 (иногда так сохраняет Блокнот) и пустой файл."""
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return ""
+    if not raw:
+        return ""
+    if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return raw.decode("utf-16")
+    return raw.decode("utf-8-sig")
+
+
+def _parse_simple_env_file(path: Path) -> dict[str, str]:
+    """Парсинг .env: export KEY=, BOM, UTF-16."""
+    if not path.is_file():
+        return {}
+    text = _read_env_file_as_text(path)
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if line.lower().startswith("export "):
+            line = line[7:].lstrip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        k, v = k.strip(), v.strip()
+        if len(v) >= 2 and v[0] == v[-1] and v[0] in "\"'":
+            v = v[1:-1]
+        if k:
+            out[k] = v
+    return out
+
+
+def _env_file_hints(primary: Path) -> str:
+    """Подсказки, если .env есть, а ключа нет."""
+    hints: list[str] = []
+    if not primary.is_file():
+        return ""
+    try:
+        size = primary.stat().st_size
+    except OSError:
+        return ""
+    if size == 0:
+        hints.append(
+            "Файл .env на диске пустой (0 байт) — сохраните вкладку в редакторе (Cmd+S), затем снова запустите cli."
+        )
+    parsed = _parse_simple_env_file(primary)
+    if size > 0 and "GROQ_API_KEY" not in parsed and "OPENAI_API_KEY" not in parsed:
+        hints.append(
+            "В .env не найдена строка GROQ_API_KEY=... Проверьте имя переменной, без пробелов до/после =."
+        )
+    if hints:
+        return "\n  " + "\n  ".join(hints)
+    return ""
+
+
+def _dotenv_paths() -> list[Path]:
+    """Рядом с agent.py и (если отличается) в текущей рабочей директории."""
+    paths: list[Path] = []
+    seen: set[Path] = set()
+    for p in (_AGENT_DIR / ".env", Path.cwd() / ".env"):
+        try:
+            r = p.resolve()
+        except OSError:
+            r = p
+        if r not in seen:
+            seen.add(r)
+            paths.append(p)
+    return paths
+
+
+def _load_project_dotenv() -> None:
+    # Пустая строка в окружении не должна перекрывать .env (поведение python-dotenv по умолчанию).
+    for var in ("GROQ_API_KEY", "OPENAI_API_KEY"):
+        if not (os.environ.get(var) or "").strip():
+            os.environ.pop(var, None)
+    for path in _dotenv_paths():
+        if not path.is_file():
+            continue
+        if load_dotenv is not None:
+            load_dotenv(path, encoding="utf-8-sig")
+        for k, v in _parse_simple_env_file(path).items():
+            if v and not (os.environ.get(k) or "").strip():
+                os.environ[k] = v
 
 
 # Как в AiAdvent1: Groq OpenAI-совместимый endpoint и та же модель по умолчанию.
@@ -45,10 +142,11 @@ class AgentConfig:
 
     @classmethod
     def from_env(cls) -> AgentConfig:
+        _load_project_dotenv()
         base = os.environ.get("OPENAI_BASE_URL", GROQ_CHAT_COMPLETIONS_BASE).rstrip("/")
         if not base.endswith("/v1"):
             base = base.rstrip("/") + "/v1"
-        # Синхронно с Android: local.properties GROQ_API_KEY → в shell: export GROQ_API_KEY=...
+        # Ключ: .env (локально) или export GROQ_API_KEY=... / как в Android local.properties
         key = (os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY") or "").strip()
         model = (
             os.environ.get("GROQ_MODEL")
@@ -74,14 +172,24 @@ class LLMAgent:
     def _chat_completions_url(self) -> str:
         return f"{self._config.base_url}/chat/completions"
 
+    def _effective_api_key(self) -> str:
+        """Ключ из явного AgentConfig или заново из окружения/.env (после старта CLI)."""
+        if self._config.api_key:
+            return self._config.api_key.strip()
+        _load_project_dotenv()
+        return (
+            os.environ.get("GROQ_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+        ).strip()
+
     def _headers(self) -> dict[str, str]:
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",
             "User-Agent": os.environ.get("HTTP_USER_AGENT", _DEFAULT_UA),
         }
-        if self._config.api_key:
-            h["Authorization"] = f"Bearer {self._config.api_key}"
+        key = self._effective_api_key()
+        if key:
+            h["Authorization"] = f"Bearer {key}"
         return h
 
     def _ensure_model(self) -> str:
@@ -108,10 +216,22 @@ class LLMAgent:
         if not text:
             return ""
 
-        if not self._config.api_key:
+        if not self._effective_api_key():
+            primary = _AGENT_DIR / ".env"
+            extra = _env_file_hints(primary)
+            size_s = "—"
+            if primary.is_file():
+                try:
+                    size_s = str(primary.stat().st_size)
+                except OSError:
+                    pass
             return (
-                "Добавьте ключ: export GROQ_API_KEY=gsk_... "
-                "(как в AiAdvent1/local.properties, ключи: https://console.groq.com/keys)"
+                "Добавьте GROQ_API_KEY: файл .env рядом с agent.py (см. .env.example) "
+                "или export GROQ_API_KEY=...\n"
+                f"  Ожидаемый путь: {primary} (есть на диске: {'да' if primary.is_file() else 'нет'})\n"
+                f"  Размер файла: {size_s} байт\n"
+                "  Ключи: https://console.groq.com/keys"
+                f"{extra}"
             )
 
         model = self._ensure_model()

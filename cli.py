@@ -24,9 +24,15 @@ def main() -> None:
         print(out)
         return
 
-    print("Интерактивный режим. Пустая строка — выход. Ctrl+D — выход.\n")
-    for line in sys.stdin:
-        user = line.rstrip("\n\r")
+    print(
+        "Интерактивный режим (это не терминал bash — команды echo/export здесь не работают).\n"
+        "Пустая строка — выход. Ctrl+D — выход.\n"
+    )
+    while True:
+        try:
+            user = input("Сообщение: ").rstrip("\n\r")
+        except EOFError:
+            break
         if user == "":
             break
         print(agent.run(user))
