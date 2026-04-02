@@ -356,9 +356,92 @@ class AgentConfig:
         )
 
 
+def _parse_tokens_count_response(data: Any) -> int | None:
+    """Разбор ответа POST /api/v1/tokens/count (dict, список по строкам input или число)."""
+    if isinstance(data, (int, float)):
+        return int(data)
+    if isinstance(data, list):
+        total = 0
+        found = False
+        for item in data:
+            n = _parse_tokens_count_response(item)
+            if n is not None:
+                total += n
+                found = True
+        return total if found else None
+    if not isinstance(data, dict):
+        return None
+    u = data.get("usage")
+    if isinstance(u, dict):
+        for key in ("total_tokens", "prompt_tokens", "tokens"):
+            v = u.get(key)
+            if isinstance(v, (int, float)):
+                return int(v)
+    for key in ("total_tokens", "tokens", "token"):
+        v = data.get(key)
+        if isinstance(v, (int, float)):
+            return int(v)
+    inner = data.get("data")
+    if isinstance(inner, list):
+        return _parse_tokens_count_response(inner)
+    return None
+
+
+def _parse_usage_from_completion(response_json: dict[str, Any]) -> dict[str, int | None]:
+    u = response_json.get("usage")
+    if not isinstance(u, dict):
+        return {
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "precached_prompt_tokens": None,
+        }
+    out: dict[str, int | None] = {}
+    for key in ("prompt_tokens", "completion_tokens", "total_tokens", "precached_prompt_tokens"):
+        v = u.get(key)
+        out[key] = int(v) if isinstance(v, (int, float)) else None
+    return out
+
+
+@dataclass
+class TokenStats:
+    """Токены: текущая реплика пользователя, весь диалог на входе (подсчёт), ответ; данные usage из ответа генерации."""
+
+    user_turn_tokens: int | None
+    dialog_input_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    precached_prompt_tokens: int | None
+    prompt_tokens_usage: int | None
+
+    def format_line(self) -> str:
+        parts: list[str] = []
+        if self.user_turn_tokens is not None:
+            parts.append(f"текущая реплика: {self.user_turn_tokens}")
+        if self.dialog_input_tokens is not None:
+            parts.append(f"весь диалог (вход): {self.dialog_input_tokens}")
+        if self.completion_tokens is not None:
+            parts.append(f"ответ: {self.completion_tokens}")
+        if self.prompt_tokens_usage is not None:
+            parts.append(f"prompt (usage): {self.prompt_tokens_usage}")
+        if self.precached_prompt_tokens is not None and self.precached_prompt_tokens > 0:
+            parts.append(f"из кэша prompt: {self.precached_prompt_tokens}")
+        if self.total_tokens is not None:
+            parts.append(f"всего к тарификации: {self.total_tokens}")
+        if not parts:
+            return ""
+        return "[Токены] " + " | ".join(parts)
+
+
+@dataclass
+class RunResult:
+    text: str
+    stats: TokenStats | None = None
+
+
 class LLMAgent:
     """
-    Сущность «агент»: принимает пользовательский запрос, вызывает LLM, возвращает текст ответа.
+    Сущность «агент»: принимает пользовательский запрос, вызывает LLM, возвращает RunResult.
     История диалога хранится в JSON и подгружается при старте (см. load_chat_history_file).
     """
 
@@ -418,13 +501,42 @@ class LLMAgent:
         self._resolved_model = str(models[0]["id"])
         return self._resolved_model
 
-    def run(self, user_message: str) -> str:
+    def _tokens_count(
+        self,
+        access_token: str,
+        model: str,
+        input_strings: list[str],
+    ) -> int | None:
+        """POST /api/v1/tokens/count — оценка токенов по списку строк input."""
+        if not input_strings:
+            return None
+        url = f"{self._config.api_base}/tokens/count"
+        payload: dict[str, Any] = {"model": model, "input": input_strings}
+        body = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers=self._bearer_headers(access_token),
+            method="POST",
+        )
+        try:
+            ctx = _ssl_context_for_url(url)
+            with urllib.request.urlopen(
+                req, timeout=min(60.0, self._config.timeout_sec), context=ctx
+            ) as resp:
+                raw = resp.read().decode("utf-8")
+            data: Any = json.loads(raw)
+        except (OSError, urllib.error.HTTPError, json.JSONDecodeError):
+            return None
+        return _parse_tokens_count_response(data)
+
+    def run(self, user_message: str) -> RunResult:
         """
-        Основной вход агента: один пользовательский запрос → текст ответа модели.
+        Основной вход агента: один пользовательский запрос → текст ответа модели и статистика токенов.
         """
         text = (user_message or "").strip()
         if not text:
-            return ""
+            return RunResult(text="")
 
         auth_key = self._effective_authorization_key()
         if not auth_key:
@@ -436,14 +548,16 @@ class LLMAgent:
                     size_s = str(primary.stat().st_size)
                 except OSError:
                     pass
-            return (
-                "Добавьте GIGACHAT_API_KEY: файл .env рядом с agent.py "
-                "или export GIGACHAT_API_KEY=...\n"
-                f"  Ожидаемый путь: {primary} (есть на диске: {'да' if primary.is_file() else 'нет'})\n"
-                f"  Размер файла: {size_s} байт\n"
-                "  Ключ авторизации: личный кабинет Studio → проект GigaChat API → Настройки API → Получить ключ\n"
-                "  Документация: https://developers.sber.ru/docs/ru/gigachat/quickstart/ind-using-api"
-                f"{extra}"
+            return RunResult(
+                text=(
+                    "Добавьте GIGACHAT_API_KEY: файл .env рядом с agent.py "
+                    "или export GIGACHAT_API_KEY=...\n"
+                    f"  Ожидаемый путь: {primary} (есть на диске: {'да' if primary.is_file() else 'нет'})\n"
+                    f"  Размер файла: {size_s} байт\n"
+                    "  Ключ авторизации: личный кабинет Studio → проект GigaChat API → Настройки API → Получить ключ\n"
+                    "  Документация: https://developers.sber.ru/docs/ru/gigachat/quickstart/ind-using-api"
+                    f"{extra}"
+                )
             )
 
         try:
@@ -455,26 +569,31 @@ class LLMAgent:
             )
         except OSError as e:
             msg = f"Ошибка при получении токена OAuth: {e}"
-            return msg + _ssl_troubleshooting_hint(e)
+            return RunResult(text=msg + _ssl_troubleshooting_hint(e))
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            return f"Ошибка OAuth HTTP {e.code}: {err_body[:2000]}"
+            return RunResult(text=f"Ошибка OAuth HTTP {e.code}: {err_body[:2000]}")
         except (json.JSONDecodeError, RuntimeError, KeyError, TypeError) as e:
-            return f"Ошибка разбора ответа OAuth: {e}"
+            return RunResult(text=f"Ошибка разбора ответа OAuth: {e}")
 
         try:
             model = self._ensure_model(access_token)
         except OSError as e:
             msg = f"Сетевая ошибка при запросе списка моделей: {e}"
-            return msg + _ssl_troubleshooting_hint(e)
+            return RunResult(text=msg + _ssl_troubleshooting_hint(e))
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            return f"Ошибка HTTP {e.code} (models): {err_body[:2000]}"
+            return RunResult(text=f"Ошибка HTTP {e.code} (models): {err_body[:2000]}")
         except RuntimeError as e:
-            return str(e)
+            return RunResult(text=str(e))
 
         self._messages.append({"role": "user", "content": text})
         self._trim_messages()
+
+        user_turn_tokens = self._tokens_count(access_token, model, [text])
+        dialog_input_tokens = self._tokens_count(
+            access_token, model, [m["content"] for m in self._messages]
+        )
 
         payload = {
             "model": model,
@@ -507,12 +626,12 @@ class LLMAgent:
                 )
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
-            return f"Ошибка HTTP {e.code}: {detail[:2000]}"
+            return RunResult(text=f"Ошибка HTTP {e.code}: {detail[:2000]}")
         except OSError as e:
             if self._messages and self._messages[-1].get("role") == "user":
                 self._messages.pop()
             msg = f"Сетевая ошибка: {e}"
-            return msg + _ssl_troubleshooting_hint(e)
+            return RunResult(text=msg + _ssl_troubleshooting_hint(e))
 
         try:
             response_json: dict[str, Any] = json.loads(raw)
@@ -525,11 +644,22 @@ class LLMAgent:
                 reply = str(content).strip()
             else:
                 reply = raw[:2000]
+            usage = _parse_usage_from_completion(response_json)
+            stats = TokenStats(
+                user_turn_tokens=user_turn_tokens,
+                dialog_input_tokens=dialog_input_tokens,
+                completion_tokens=usage["completion_tokens"],
+                total_tokens=usage["total_tokens"],
+                precached_prompt_tokens=usage["precached_prompt_tokens"],
+                prompt_tokens_usage=usage["prompt_tokens"],
+            )
             self._messages.append({"role": "assistant", "content": reply})
             self._trim_messages()
             self._persist_history()
-            return reply
+            return RunResult(text=reply, stats=stats)
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
             if self._messages and self._messages[-1].get("role") == "user":
                 self._messages.pop()
-            return f"Не удалось разобрать ответ API: {e}\nФрагмент: {raw[:500]}"
+            return RunResult(
+                text=f"Не удалось разобрать ответ API: {e}\nФрагмент: {raw[:500]}"
+            )

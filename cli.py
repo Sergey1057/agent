@@ -4,9 +4,16 @@
 """
 
 import argparse
-import sys
 
-from agent import LLMAgent, clear_history_file
+from agent import LLMAgent, RunResult, clear_history_file
+
+
+def _print_run_result(result: RunResult) -> None:
+    print(result.text)
+    if result.stats is not None:
+        line = result.stats.format_line()
+        if line:
+            print(line)
 
 
 def main() -> None:
@@ -27,8 +34,7 @@ def main() -> None:
     agent = LLMAgent()
 
     if args.query is not None:
-        out = agent.run(args.query)
-        print(out)
+        _print_run_result(agent.run(args.query))
         return
 
     print(
@@ -41,7 +47,7 @@ def main() -> None:
             break
         if user == "":
             break
-        print(agent.run(user))
+        _print_run_result(agent.run(user))
         print()
 
 
