@@ -25,7 +25,6 @@ def main() -> None:
         return
 
     print(
-        "Интерактивный режим (это не терминал bash — команды echo/export здесь не работают).\n"
         "Пустая строка — выход. Ctrl+D — выход.\n"
     )
     while True:
@@ -41,3 +40,6 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
