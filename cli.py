@@ -6,7 +6,7 @@
 import argparse
 import sys
 
-from agent import LLMAgent
+from agent import LLMAgent, clear_history_file
 
 
 def main() -> None:
@@ -16,7 +16,14 @@ def main() -> None:
         "--query",
         help="Один запрос без интерактивного режима",
     )
+    p.add_argument(
+        "--reset-history",
+        action="store_true",
+        help="Очистить сохранённую историю диалога и начать новый чат",
+    )
     args = p.parse_args()
+    if args.reset_history:
+        clear_history_file()
     agent = LLMAgent()
 
     if args.query is not None:

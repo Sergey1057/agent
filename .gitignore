@@ -6,3 +6,5 @@ venv/
 .env.*
 !.env.example
 .DS_Store
+chat_history.json
+chat_history.json.tmp

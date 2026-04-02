@@ -28,6 +28,9 @@ except ImportError:
 
 _AGENT_DIR = Path(__file__).resolve().parent
 
+DEFAULT_HISTORY_FILENAME = "chat_history.json"
+DEFAULT_HISTORY_MAX_MESSAGES = 200
+
 # GigaChat: OAuth и REST (см. документацию Сбера)
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_API_V1_BASE = "https://gigachat.devices.sberbank.ru/api/v1"
@@ -179,6 +182,80 @@ def _ssl_context_for_url(url: str) -> ssl.SSLContext | None:
     return ssl.create_default_context(cafile=certifi.where())
 
 
+def _history_path_resolved() -> Path:
+    """Путь к JSON с историей: LLM_AGENT_HISTORY_FILE или chat_history.json рядом с agent.py."""
+    _load_project_dotenv()
+    raw = (os.environ.get("LLM_AGENT_HISTORY_FILE") or "").strip()
+    if raw:
+        return Path(raw).expanduser().resolve()
+    return (_AGENT_DIR / DEFAULT_HISTORY_FILENAME).resolve()
+
+
+def _history_max_from_env() -> int:
+    _load_project_dotenv()
+    raw = (os.environ.get("LLM_AGENT_HISTORY_MAX_MESSAGES") or "").strip()
+    if not raw:
+        return DEFAULT_HISTORY_MAX_MESSAGES
+    try:
+        n = int(raw)
+        return max(2, min(n, 10_000))
+    except ValueError:
+        return DEFAULT_HISTORY_MAX_MESSAGES
+
+
+def _normalize_chat_messages(raw: Any) -> list[dict[str, str]]:
+    out: list[dict[str, str]] = []
+    if not isinstance(raw, list):
+        return out
+    for m in raw:
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role")
+        content = m.get("content")
+        if role not in ("user", "assistant", "system"):
+            continue
+        if not isinstance(content, str):
+            content = "" if content is None else str(content)
+        out.append({"role": str(role), "content": content})
+    return out
+
+
+def load_chat_history_file(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return []
+    if isinstance(data, dict):
+        raw_list = data.get("messages")
+    elif isinstance(data, list):
+        raw_list = data
+    else:
+        return []
+    return _normalize_chat_messages(raw_list)
+
+
+def save_chat_history_file(path: Path, messages: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"version": 1, "messages": messages}
+    tmp = path.with_name(path.name + ".tmp")
+    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    tmp.write_text(data, encoding="utf-8")
+    tmp.replace(path)
+
+
+def clear_history_file() -> None:
+    """Удаляет файл истории (путь как у LLMAgent)."""
+    p = _history_path_resolved()
+    try:
+        if p.is_file():
+            p.unlink()
+    except OSError:
+        pass
+
+
 def _ssl_troubleshooting_hint(exc: BaseException) -> str:
     s = f"{exc!s} {getattr(exc, 'reason', '')!s}".lower()
     if "certificate_verify_failed" not in s and "certificate verify failed" not in s:
@@ -282,11 +359,26 @@ class AgentConfig:
 class LLMAgent:
     """
     Сущность «агент»: принимает пользовательский запрос, вызывает LLM, возвращает текст ответа.
+    История диалога хранится в JSON и подгружается при старте (см. load_chat_history_file).
     """
 
     def __init__(self, config: AgentConfig | None = None) -> None:
         self._config = config or AgentConfig.from_env()
         self._resolved_model: str | None = self._config.model
+        self._history_path = _history_path_resolved()
+        self._history_max_messages = _history_max_from_env()
+        self._messages: list[dict[str, str]] = load_chat_history_file(self._history_path)
+
+    def _trim_messages(self) -> None:
+        if len(self._messages) <= self._history_max_messages:
+            return
+        del self._messages[: len(self._messages) - self._history_max_messages]
+
+    def _persist_history(self) -> None:
+        try:
+            save_chat_history_file(self._history_path, self._messages)
+        except OSError:
+            pass
 
     def _chat_completions_url(self) -> str:
         return f"{self._config.api_base}/chat/completions"
@@ -381,9 +473,12 @@ class LLMAgent:
         except RuntimeError as e:
             return str(e)
 
+        self._messages.append({"role": "user", "content": text})
+        self._trim_messages()
+
         payload = {
             "model": model,
-            "messages": [{"role": "user", "content": text}],
+            "messages": list(self._messages),
             "stream": False,
         }
         body = json.dumps(payload).encode("utf-8")
@@ -401,6 +496,8 @@ class LLMAgent:
             ) as resp:
                 raw = resp.read().decode("utf-8")
         except urllib.error.HTTPError as e:
+            if self._messages and self._messages[-1].get("role") == "user":
+                self._messages.pop()
             err_body = e.read().decode("utf-8", errors="replace")
             detail = err_body
             try:
@@ -412,6 +509,8 @@ class LLMAgent:
                 pass
             return f"Ошибка HTTP {e.code}: {detail[:2000]}"
         except OSError as e:
+            if self._messages and self._messages[-1].get("role") == "user":
+                self._messages.pop()
             msg = f"Сетевая ошибка: {e}"
             return msg + _ssl_troubleshooting_hint(e)
 
@@ -421,9 +520,16 @@ class LLMAgent:
             msg = choice.get("message") or {}
             content = msg.get("content")
             if isinstance(content, str):
-                return content.strip()
-            if content is not None:
-                return str(content).strip()
-            return raw[:2000]
+                reply = content.strip()
+            elif content is not None:
+                reply = str(content).strip()
+            else:
+                reply = raw[:2000]
+            self._messages.append({"role": "assistant", "content": reply})
+            self._trim_messages()
+            self._persist_history()
+            return reply
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
+            if self._messages and self._messages[-1].get("role") == "user":
+                self._messages.pop()
             return f"Не удалось разобрать ответ API: {e}\nФрагмент: {raw[:500]}"
