@@ -525,7 +525,9 @@ class LLMAgent:
         ):
             batch = self._messages[:CONTEXT_SUMMARIZE_EVERY_N]
             try:
-                chunk = self._summarize_dialog_batch(access_token, model, batch)
+                chunk = self._summarize_dialog_batch(
+                    access_token, model, batch, self._context_summary
+                )
             except (
                 OSError,
                 urllib.error.HTTPError,
@@ -539,6 +541,7 @@ class LLMAgent:
             if not (chunk or "").strip():
                 break
             self._messages = self._messages[CONTEXT_SUMMARIZE_EVERY_N :]
+            # Накопление: прежний summary не затирается — к нему дописывается новый фрагмент.
             self._context_summary = _merge_context_summaries(self._context_summary, chunk)
 
     def _summarize_dialog_batch(
@@ -546,6 +549,7 @@ class LLMAgent:
         access_token: str,
         model: str,
         batch: list[dict[str, str]],
+        existing_summary: str,
     ) -> str:
         lines: list[str] = []
         for m in batch:
@@ -557,16 +561,32 @@ class LLMAgent:
             else:
                 lines.append(f"{role}: {content}")
         dialog_text = "\n".join(lines)
+        prev = (existing_summary or "").strip()
+        if prev:
+            user_block = (
+                "Уже сохранено краткое содержание более раннего диалога "
+                "(оно остаётся в памяти; не переписывай его и не дублируй целиком):\n\n"
+                f"{prev}\n\n"
+                "Новый фрагмент диалога, который нужно учесть:\n\n"
+                f"{dialog_text}\n\n"
+                "Сформулируй только краткое дополнение к резюме по этому новому фрагменту "
+                "(факты, договорённости, открытые вопросы). Без вступлений."
+            )
+            system_prompt = (
+                "Ты помогаешь вести накопительное резюме беседы. "
+                "Пользователь уже хранит старое резюме; твой ответ — только новый блок "
+                "про последний фрагмент, на русском, без повторения старого текста."
+            )
+        else:
+            user_block = dialog_text
+            system_prompt = (
+                "Сожми следующий фрагмент диалога в краткое резюме на русском. "
+                "Сохрани факты, вопросы, договорённости и нерешённые моменты. "
+                "Ответь только текстом резюме, без вступлений."
+            )
         msgs = [
-            {
-                "role": "system",
-                "content": (
-                    "Сожми следующий фрагмент диалога в краткое резюме на русском. "
-                    "Сохрани факты, вопросы, договорённости и нерешённые моменты. "
-                    "Ответь только текстом резюме, без вступлений."
-                ),
-            },
-            {"role": "user", "content": dialog_text},
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_block},
         ]
         text, _ = self._complete_chat(access_token, model, msgs)
         return text
