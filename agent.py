@@ -31,6 +31,14 @@ _AGENT_DIR = Path(__file__).resolve().parent
 DEFAULT_HISTORY_FILENAME = "chat_history.json"
 DEFAULT_HISTORY_MAX_MESSAGES = 200
 
+# Управление контекстом: в API уходят последние N реплик полностью; более раннее
+# сжимается в summary блоками по M сообщений (из «головы» списка, всё кроме хвоста N).
+CONTEXT_RECENT_MESSAGE_COUNT = 5
+CONTEXT_SUMMARIZE_EVERY_N = 10
+CONTEXT_SUMMARY_HEADER = (
+    "Краткое содержание более раннего диалога (для продолжения беседы):\n"
+)
+
 # GigaChat: OAuth и REST (см. документацию Сбера)
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
 GIGACHAT_API_V1_BASE = "https://gigachat.devices.sberbank.ru/api/v1"
@@ -221,29 +229,52 @@ def _normalize_chat_messages(raw: Any) -> list[dict[str, str]]:
 
 
 def load_chat_history_file(path: Path) -> list[dict[str, str]]:
+    """Обратная совместимость: только список сообщений (summary теряется)."""
+    _, messages = load_chat_history_state(path)
+    return messages
+
+
+def load_chat_history_state(path: Path) -> tuple[str, list[dict[str, str]]]:
+    """Загружает (summary, messages). Старый формат без summary → пустая строка."""
     if not path.is_file():
-        return []
+        return "", []
     try:
         text = path.read_text(encoding="utf-8-sig")
         data = json.loads(text)
     except (OSError, json.JSONDecodeError):
-        return []
+        return "", []
+    summary = ""
     if isinstance(data, dict):
         raw_list = data.get("messages")
+        s = data.get("summary")
+        if isinstance(s, str):
+            summary = s
     elif isinstance(data, list):
         raw_list = data
     else:
-        return []
-    return _normalize_chat_messages(raw_list)
+        return "", []
+    return summary, _normalize_chat_messages(raw_list)
 
 
-def save_chat_history_file(path: Path, messages: list[dict[str, str]]) -> None:
+def save_chat_history_file(
+    path: Path, messages: list[dict[str, str]], summary: str = ""
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 1, "messages": messages}
+    payload = {"version": 2, "summary": summary, "messages": messages}
     tmp = path.with_name(path.name + ".tmp")
     data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
     tmp.write_text(data, encoding="utf-8")
     tmp.replace(path)
+
+
+def _merge_context_summaries(previous: str, new_chunk: str) -> str:
+    a = (previous or "").strip()
+    b = (new_chunk or "").strip()
+    if not a:
+        return b
+    if not b:
+        return a
+    return a + "\n\n---\n\n" + b
 
 
 def clear_history_file() -> None:
@@ -442,7 +473,10 @@ class RunResult:
 class LLMAgent:
     """
     Сущность «агент»: принимает пользовательский запрос, вызывает LLM, возвращает RunResult.
-    История диалога хранится в JSON и подгружается при старте (см. load_chat_history_file).
+    Полная история реплик и отдельное поле summary хранятся в JSON (см. load_chat_history_state).
+    В запрос к модели уходит: системное сообщение с summary (если непусто), «середина» до 9
+    реплик без сжатия и последние 5 реплик полностью; каждые 10 реплик «старой» части
+    сжимаются в summary и удаляются из списка.
     """
 
     def __init__(self, config: AgentConfig | None = None) -> None:
@@ -450,7 +484,9 @@ class LLMAgent:
         self._resolved_model: str | None = self._config.model
         self._history_path = _history_path_resolved()
         self._history_max_messages = _history_max_from_env()
-        self._messages: list[dict[str, str]] = load_chat_history_file(self._history_path)
+        self._context_summary, self._messages = load_chat_history_state(
+            self._history_path
+        )
 
     def _trim_messages(self) -> None:
         if len(self._messages) <= self._history_max_messages:
@@ -459,9 +495,117 @@ class LLMAgent:
 
     def _persist_history(self) -> None:
         try:
-            save_chat_history_file(self._history_path, self._messages)
+            save_chat_history_file(
+                self._history_path, self._messages, self._context_summary
+            )
         except OSError:
             pass
+
+    def _build_messages_for_api(self) -> list[dict[str, str]]:
+        """Summary отдельно системным сообщением; «середина» (до 9 реплик) и хвост из 5 — как в логе."""
+        out: list[dict[str, str]] = []
+        s = (self._context_summary or "").strip()
+        if s:
+            out.append({"role": "system", "content": CONTEXT_SUMMARY_HEADER + s})
+        n = len(self._messages)
+        tail = CONTEXT_RECENT_MESSAGE_COUNT
+        if n > tail:
+            out.extend(self._messages[:-tail])
+        out.extend(self._messages[-tail:] if n >= tail else self._messages)
+        return out
+
+    def _compact_stored_context(self, access_token: str, model: str) -> None:
+        """
+        Пока «старых» сообщений (всё кроме последних CONTEXT_RECENT_MESSAGE_COUNT)
+        не меньше CONTEXT_SUMMARIZE_EVERY_N — сжимает первые N в summary и удаляет их из списка.
+        """
+        while (
+            len(self._messages) - CONTEXT_RECENT_MESSAGE_COUNT
+            >= CONTEXT_SUMMARIZE_EVERY_N
+        ):
+            batch = self._messages[:CONTEXT_SUMMARIZE_EVERY_N]
+            try:
+                chunk = self._summarize_dialog_batch(access_token, model, batch)
+            except (
+                OSError,
+                urllib.error.HTTPError,
+                RuntimeError,
+                KeyError,
+                TypeError,
+                IndexError,
+                json.JSONDecodeError,
+            ):
+                break
+            if not (chunk or "").strip():
+                break
+            self._messages = self._messages[CONTEXT_SUMMARIZE_EVERY_N :]
+            self._context_summary = _merge_context_summaries(self._context_summary, chunk)
+
+    def _summarize_dialog_batch(
+        self,
+        access_token: str,
+        model: str,
+        batch: list[dict[str, str]],
+    ) -> str:
+        lines: list[str] = []
+        for m in batch:
+            role, content = m.get("role", ""), m.get("content", "")
+            if role == "user":
+                lines.append(f"Пользователь: {content}")
+            elif role == "assistant":
+                lines.append(f"Ассистент: {content}")
+            else:
+                lines.append(f"{role}: {content}")
+        dialog_text = "\n".join(lines)
+        msgs = [
+            {
+                "role": "system",
+                "content": (
+                    "Сожми следующий фрагмент диалога в краткое резюме на русском. "
+                    "Сохрани факты, вопросы, договорённости и нерешённые моменты. "
+                    "Ответь только текстом резюме, без вступлений."
+                ),
+            },
+            {"role": "user", "content": dialog_text},
+        ]
+        text, _ = self._complete_chat(access_token, model, msgs)
+        return text
+
+    def _complete_chat(
+        self,
+        access_token: str,
+        model: str,
+        messages: list[dict[str, str]],
+    ) -> tuple[str, dict[str, Any]]:
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": list(messages),
+            "stream": False,
+        }
+        body = json.dumps(payload).encode("utf-8")
+        url = self._chat_completions_url()
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers=self._bearer_headers(access_token),
+            method="POST",
+        )
+        ctx = _ssl_context_for_url(url)
+        with urllib.request.urlopen(
+            req, timeout=self._config.timeout_sec, context=ctx
+        ) as resp:
+            raw = resp.read().decode("utf-8")
+        response_json: dict[str, Any] = json.loads(raw)
+        choice = (response_json.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            reply = content.strip()
+        elif content is not None:
+            reply = str(content).strip()
+        else:
+            reply = raw[:2000].strip()
+        return reply, response_json
 
     def _chat_completions_url(self) -> str:
         return f"{self._config.api_base}/chat/completions"
@@ -588,32 +732,17 @@ class LLMAgent:
             return RunResult(text=str(e))
 
         self._messages.append({"role": "user", "content": text})
+        self._compact_stored_context(access_token, model)
         self._trim_messages()
 
         user_turn_tokens = self._tokens_count(access_token, model, [text])
+        api_messages = self._build_messages_for_api()
         dialog_input_tokens = self._tokens_count(
-            access_token, model, [m["content"] for m in self._messages]
+            access_token, model, [m["content"] for m in api_messages]
         )
 
-        payload = {
-            "model": model,
-            "messages": list(self._messages),
-            "stream": False,
-        }
-        body = json.dumps(payload).encode("utf-8")
-        url = self._chat_completions_url()
-        req = urllib.request.Request(
-            url,
-            data=body,
-            headers=self._bearer_headers(access_token),
-            method="POST",
-        )
         try:
-            ctx = _ssl_context_for_url(url)
-            with urllib.request.urlopen(
-                req, timeout=self._config.timeout_sec, context=ctx
-            ) as resp:
-                raw = resp.read().decode("utf-8")
+            reply, response_json = self._complete_chat(access_token, model, api_messages)
         except urllib.error.HTTPError as e:
             if self._messages and self._messages[-1].get("role") == "user":
                 self._messages.pop()
@@ -632,34 +761,22 @@ class LLMAgent:
                 self._messages.pop()
             msg = f"Сетевая ошибка: {e}"
             return RunResult(text=msg + _ssl_troubleshooting_hint(e))
-
-        try:
-            response_json: dict[str, Any] = json.loads(raw)
-            choice = (response_json.get("choices") or [{}])[0]
-            msg = choice.get("message") or {}
-            content = msg.get("content")
-            if isinstance(content, str):
-                reply = content.strip()
-            elif content is not None:
-                reply = str(content).strip()
-            else:
-                reply = raw[:2000]
-            usage = _parse_usage_from_completion(response_json)
-            stats = TokenStats(
-                user_turn_tokens=user_turn_tokens,
-                dialog_input_tokens=dialog_input_tokens,
-                completion_tokens=usage["completion_tokens"],
-                total_tokens=usage["total_tokens"],
-                precached_prompt_tokens=usage["precached_prompt_tokens"],
-                prompt_tokens_usage=usage["prompt_tokens"],
-            )
-            self._messages.append({"role": "assistant", "content": reply})
-            self._trim_messages()
-            self._persist_history()
-            return RunResult(text=reply, stats=stats)
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
             if self._messages and self._messages[-1].get("role") == "user":
                 self._messages.pop()
-            return RunResult(
-                text=f"Не удалось разобрать ответ API: {e}\nФрагмент: {raw[:500]}"
-            )
+            return RunResult(text=f"Не удалось разобрать ответ API: {e}")
+
+        usage = _parse_usage_from_completion(response_json)
+        stats = TokenStats(
+            user_turn_tokens=user_turn_tokens,
+            dialog_input_tokens=dialog_input_tokens,
+            completion_tokens=usage["completion_tokens"],
+            total_tokens=usage["total_tokens"],
+            precached_prompt_tokens=usage["precached_prompt_tokens"],
+            prompt_tokens_usage=usage["prompt_tokens"],
+        )
+        self._messages.append({"role": "assistant", "content": reply})
+        self._compact_stored_context(access_token, model)
+        self._trim_messages()
+        self._persist_history()
+        return RunResult(text=reply, stats=stats)
