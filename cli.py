@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
 Тонкий интерфейс: только ввод/вывод. Вся работа с API — в LLMAgent.
+Стратегия контекста: --context-strategy или LLM_AGENT_CONTEXT_STRATEGY.
 """
+
+from __future__ import annotations
 
 import argparse
 
 from agent import LLMAgent, RunResult, clear_history_file
+from context_strategies import ContextStrategyKind
 
 
 def _print_run_result(result: RunResult) -> None:
@@ -14,6 +18,85 @@ def _print_run_result(result: RunResult) -> None:
         line = result.stats.format_line()
         if line:
             print(line)
+
+
+def _strategy_from_arg(raw: str | None) -> ContextStrategyKind | None:
+    if raw is None or raw.strip() == "":
+        return None
+    return ContextStrategyKind(raw.strip())
+
+
+def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
+    """
+    Обрабатывает команды, начинающиеся с /.
+    Возвращает текст для печати; None — передать строку в agent.run как обычное сообщение.
+    """
+    s = line.strip()
+    if not s.startswith("/"):
+        return None
+    parts = s.split(maxsplit=1)
+    cmd = parts[0].lower()
+    arg = parts[1].strip() if len(parts) > 1 else ""
+
+    if cmd in ("/help", "/?"):
+        return (
+            "Команды:\n"
+            "  /strategy [sliding_window|sticky_facts|branching] — текущая или смена стратегии\n"
+            "  /facts — показать блок facts (sticky_facts)\n"
+            "  /fact ключ остальное_текстом_значение — добавить/обновить факт вручную\n"
+            "  /split или /checkpoint — checkpoint и две ветки (только branching)\n"
+            "  /switch или /checkout <branch_a|branch_b> — смена активной ветки\n"
+            "  /status — состояние ветвления\n"
+            "  /help — эта справка"
+        )
+
+    if cmd == "/strategy":
+        if not arg:
+            return f"Текущая стратегия: {agent.context_strategy.value}"
+        try:
+            agent.set_context_strategy(arg)
+        except ValueError as e:
+            return f"Неизвестная стратегия: {e}"
+        return f"Стратегия переключена на: {agent.context_strategy.value}"
+
+    if cmd == "/facts":
+        return agent.format_facts_lines()
+
+    if cmd == "/fact":
+        if not arg:
+            return (
+                "Формат: /fact ключ текст значения (всё после первого слова — значение).\n"
+                "Пример: /fact цель выполнить домашнее задание"
+            )
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            return "Укажите и ключ, и значение: /fact ключ значение"
+        ok, err = agent.merge_fact(parts[0], parts[1])
+        if not ok:
+            return err
+        v = parts[1]
+        tail = "…" if len(v) > 200 else ""
+        return f"Записано: {parts[0]} = {v[:200]}{tail}"
+
+    if cmd in ("/split", "/checkpoint"):
+        ok, err = agent.split_dialog_branches()
+        if ok:
+            return "Checkpoint: созданы ветки branch_a и branch_b. Активна branch_a."
+        return f"Не удалось: {err}"
+
+    if cmd in ("/switch", "/checkout"):
+        if not arg:
+            return "Укажите ветку: /switch branch_b или /checkout branch_b"
+        ok, err = agent.switch_dialog_branch(arg)
+        if ok:
+            return f"Активная ветка: {arg}"
+        return f"Не удалось: {err}"
+
+    if cmd == "/status":
+        return agent.branching_status_line()
+
+    # Не наша команда — пусть уйдёт в модель (например /path/to/file)
+    return None
 
 
 def main() -> None:
@@ -28,10 +111,21 @@ def main() -> None:
         action="store_true",
         help="Очистить сохранённую историю диалога и начать новый чат",
     )
+    p.add_argument(
+        "--context-strategy",
+        choices=[x.value for x in ContextStrategyKind],
+        default=None,
+        help=(
+            "Стратегия контекста (иначе LLM_AGENT_CONTEXT_STRATEGY, по умолчанию из файла "
+            "или sliding_window)"
+        ),
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
-    agent = LLMAgent()
+
+    strat = _strategy_from_arg(args.context_strategy)
+    agent = LLMAgent(context_strategy=strat)
 
     if args.query is not None:
         _print_run_result(agent.run(args.query))
@@ -39,6 +133,8 @@ def main() -> None:
 
     print(
         "Пустая строка — выход. Ctrl+D — выход.\n"
+        f"{agent.branching_status_line()}\n"
+        "Команды: /help\n"
     )
     while True:
         try:
@@ -47,12 +143,15 @@ def main() -> None:
             break
         if user == "":
             break
+        if user.startswith("/"):
+            out = _handle_slash_command(agent, user)
+            if out is not None:
+                print(out)
+                print()
+                continue
         _print_run_result(agent.run(user))
         print()
 
 
 if __name__ == "__main__":
     main()
-
-
-

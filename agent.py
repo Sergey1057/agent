@@ -21,6 +21,22 @@ from typing import Any
 
 import certifi
 
+from context_strategies import (
+    RECENT_MESSAGE_WINDOW,
+    ContextStrategyKind,
+    UnifiedChatState,
+    build_branching_api_messages,
+    build_sliding_api_messages,
+    build_sticky_facts_api_messages,
+    flatten_messages_for_export,
+    load_unified_state,
+    save_unified_state,
+    split_into_two_branches,
+    switch_branch,
+    trim_messages,
+    update_facts_with_llm,
+)
+
 try:
     from dotenv import load_dotenv
 except ImportError:
@@ -30,14 +46,6 @@ _AGENT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_HISTORY_FILENAME = "chat_history.json"
 DEFAULT_HISTORY_MAX_MESSAGES = 200
-
-# Управление контекстом: в API уходят последние N реплик полностью; более раннее
-# сжимается в summary блоками по M сообщений (из «головы» списка, всё кроме хвоста N).
-CONTEXT_RECENT_MESSAGE_COUNT = 5
-CONTEXT_SUMMARIZE_EVERY_N = 10
-CONTEXT_SUMMARY_HEADER = (
-    "Краткое содержание более раннего диалога (для продолжения беседы):\n"
-)
 
 # GigaChat: OAuth и REST (см. документацию Сбера)
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -209,72 +217,27 @@ def _history_max_from_env() -> int:
         return max(2, min(n, 10_000))
     except ValueError:
         return DEFAULT_HISTORY_MAX_MESSAGES
-
-
-def _normalize_chat_messages(raw: Any) -> list[dict[str, str]]:
-    out: list[dict[str, str]] = []
-    if not isinstance(raw, list):
-        return out
-    for m in raw:
-        if not isinstance(m, dict):
-            continue
-        role = m.get("role")
-        content = m.get("content")
-        if role not in ("user", "assistant", "system"):
-            continue
-        if not isinstance(content, str):
-            content = "" if content is None else str(content)
-        out.append({"role": str(role), "content": content})
-    return out
-
-
 def load_chat_history_file(path: Path) -> list[dict[str, str]]:
-    """Обратная совместимость: только список сообщений (summary теряется)."""
-    _, messages = load_chat_history_state(path)
-    return messages
+    """Список сообщений для отображения (ветка branching — активная ветка)."""
+    st = load_unified_state(path)
+    return flatten_messages_for_export(st)
 
 
 def load_chat_history_state(path: Path) -> tuple[str, list[dict[str, str]]]:
-    """Загружает (summary, messages). Старый формат без summary → пустая строка."""
-    if not path.is_file():
-        return "", []
-    try:
-        text = path.read_text(encoding="utf-8-sig")
-        data = json.loads(text)
-    except (OSError, json.JSONDecodeError):
-        return "", []
-    summary = ""
-    if isinstance(data, dict):
-        raw_list = data.get("messages")
-        s = data.get("summary")
-        if isinstance(s, str):
-            summary = s
-    elif isinstance(data, list):
-        raw_list = data
-    else:
-        return "", []
-    return summary, _normalize_chat_messages(raw_list)
+    """(summary, messages): summary всегда пуст для v3; v2 summary не поднимается в API."""
+    st = load_unified_state(path)
+    return "", flatten_messages_for_export(st)
 
 
 def save_chat_history_file(
     path: Path, messages: list[dict[str, str]], summary: str = ""
 ) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"version": 2, "summary": summary, "messages": messages}
-    tmp = path.with_name(path.name + ".tmp")
-    data = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    tmp.write_text(data, encoding="utf-8")
-    tmp.replace(path)
-
-
-def _merge_context_summaries(previous: str, new_chunk: str) -> str:
-    a = (previous or "").strip()
-    b = (new_chunk or "").strip()
-    if not a:
-        return b
-    if not b:
-        return a
-    return a + "\n\n---\n\n" + b
+    """Совместимость: сохраняет как v3 sliding с последними репликами (summary игнорируется)."""
+    st = UnifiedChatState(
+        strategy=ContextStrategyKind.SLIDING_WINDOW,
+        messages=messages[-RECENT_MESSAGE_WINDOW:],
+    )
+    save_unified_state(path, st)
 
 
 def clear_history_file() -> None:
@@ -473,123 +436,142 @@ class RunResult:
 class LLMAgent:
     """
     Сущность «агент»: принимает пользовательский запрос, вызывает LLM, возвращает RunResult.
-    Полная история реплик и отдельное поле summary хранятся в JSON (см. load_chat_history_state).
-    В запрос к модели уходит: системное сообщение с summary (если непусто), «середина» до 9
-    реплик без сжатия и последние 5 реплик полностью; каждые 10 реплик «старой» части
-    сжимаются в summary и удаляются из списка.
+    Контекст задаётся стратегией (см. context_strategies): sliding_window и sticky_facts
+    хранят последние N реплик (по умолчанию 6 = три пары user/assistant; N задаётся
+    LLM_AGENT_RECENT_MESSAGES), branching — checkpoint и две независимые ветки.
     """
 
-    def __init__(self, config: AgentConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AgentConfig | None = None,
+        *,
+        context_strategy: ContextStrategyKind | str | None = None,
+    ) -> None:
         self._config = config or AgentConfig.from_env()
         self._resolved_model: str | None = self._config.model
         self._history_path = _history_path_resolved()
         self._history_max_messages = _history_max_from_env()
-        self._context_summary, self._messages = load_chat_history_state(
-            self._history_path
+        self._state = load_unified_state(self._history_path)
+        if context_strategy is not None:
+            self._state.strategy = self._coerce_strategy(context_strategy)
+        else:
+            env_s = (os.environ.get("LLM_AGENT_CONTEXT_STRATEGY") or "").strip()
+            if env_s:
+                try:
+                    self._state.strategy = self._coerce_strategy(env_s)
+                except ValueError:
+                    pass
+
+    @staticmethod
+    def _coerce_strategy(val: ContextStrategyKind | str) -> ContextStrategyKind:
+        if isinstance(val, ContextStrategyKind):
+            return val
+        return ContextStrategyKind(str(val).strip())
+
+    def set_context_strategy(self, strategy: ContextStrategyKind | str) -> None:
+        """Переключает стратегию для текущей сессии (состояние в памяти — из файла)."""
+        self._state.strategy = self._coerce_strategy(strategy)
+
+    @property
+    def context_strategy(self) -> ContextStrategyKind:
+        return self._state.strategy
+
+    def split_dialog_branches(self) -> tuple[bool, str]:
+        """Checkpoint: создаёт две ветки (branch_a, branch_b) от текущего конца диалога."""
+        ok, err = split_into_two_branches(self._state)
+        if ok:
+            self._persist_history()
+        return (ok, err)
+
+    def switch_dialog_branch(self, branch_id: str) -> tuple[bool, str]:
+        ok, err = switch_branch(self._state, branch_id)
+        if ok:
+            self._persist_history()
+        return (ok, err)
+
+    def branching_status_line(self) -> str:
+        if self._state.strategy != ContextStrategyKind.BRANCHING:
+            return f"Стратегия: {self._state.strategy.value}"
+        if not self._state.branching_split:
+            return (
+                f"Стратегия: branching (до checkpoint; реплик: {len(self._state.messages)})"
+            )
+        bids = ", ".join(sorted(self._state.branches.keys()))
+        return (
+            f"Стратегия: branching | prefix: {len(self._state.branch_prefix)} | "
+            f"ветки: {bids} | активная: {self._state.active_branch}"
         )
 
-    def _trim_messages(self) -> None:
-        if len(self._messages) <= self._history_max_messages:
-            return
-        del self._messages[: len(self._messages) - self._history_max_messages]
+    def merge_fact(self, key: str, value: str) -> tuple[bool, str]:
+        """Ручное добавление или обновление пары ключ–значение в facts (только sticky_facts)."""
+        if self._state.strategy != ContextStrategyKind.STICKY_FACTS:
+            return (
+                False,
+                "facts используются только в режиме sticky_facts. Введите: /strategy sticky_facts",
+            )
+        k = (key or "").strip()
+        if not k:
+            return False, "Укажите непустой ключ."
+        self._state.facts[k] = (value or "").strip()
+        self._persist_history()
+        return True, ""
+
+    def format_facts_lines(self) -> str:
+        if not self._state.facts:
+            return "(facts пусто)"
+        lines = [f"  {k}: {v}" for k, v in sorted(self._state.facts.items())]
+        return "\n".join(lines)
 
     def _persist_history(self) -> None:
         try:
-            save_chat_history_file(
-                self._history_path, self._messages, self._context_summary
-            )
+            save_unified_state(self._history_path, self._state)
         except OSError:
             pass
 
-    def _build_messages_for_api(self) -> list[dict[str, str]]:
-        """Summary отдельно системным сообщением; «середина» (до 9 реплик) и хвост из 5 — как в логе."""
-        out: list[dict[str, str]] = []
-        s = (self._context_summary or "").strip()
-        if s:
-            out.append({"role": "system", "content": CONTEXT_SUMMARY_HEADER + s})
-        n = len(self._messages)
-        tail = CONTEXT_RECENT_MESSAGE_COUNT
-        if n > tail:
-            out.extend(self._messages[:-tail])
-        out.extend(self._messages[-tail:] if n >= tail else self._messages)
-        return out
-
-    def _compact_stored_context(self, access_token: str, model: str) -> None:
-        """
-        Пока «старых» сообщений (всё кроме последних CONTEXT_RECENT_MESSAGE_COUNT)
-        не меньше CONTEXT_SUMMARIZE_EVERY_N — сжимает первые N в summary и удаляет их из списка.
-        """
-        while (
-            len(self._messages) - CONTEXT_RECENT_MESSAGE_COUNT
-            >= CONTEXT_SUMMARIZE_EVERY_N
+    def _rollback_last_user(self) -> None:
+        if (
+            self._state.strategy == ContextStrategyKind.BRANCHING
+            and self._state.branching_split
         ):
-            batch = self._messages[:CONTEXT_SUMMARIZE_EVERY_N]
-            try:
-                chunk = self._summarize_dialog_batch(
-                    access_token, model, batch, self._context_summary
-                )
-            except (
-                OSError,
-                urllib.error.HTTPError,
-                RuntimeError,
-                KeyError,
-                TypeError,
-                IndexError,
-                json.JSONDecodeError,
-            ):
-                break
-            if not (chunk or "").strip():
-                break
-            self._messages = self._messages[CONTEXT_SUMMARIZE_EVERY_N :]
-            # Накопление: прежний summary не затирается — к нему дописывается новый фрагмент.
-            self._context_summary = _merge_context_summaries(self._context_summary, chunk)
+            branch = self._state.branches.get(self._state.active_branch)
+            if branch and branch[-1].get("role") == "user":
+                branch.pop()
+            return
+        if self._state.messages and self._state.messages[-1].get("role") == "user":
+            self._state.messages.pop()
 
-    def _summarize_dialog_batch(
-        self,
-        access_token: str,
-        model: str,
-        batch: list[dict[str, str]],
-        existing_summary: str,
-    ) -> str:
-        lines: list[str] = []
-        for m in batch:
-            role, content = m.get("role", ""), m.get("content", "")
-            if role == "user":
-                lines.append(f"Пользователь: {content}")
-            elif role == "assistant":
-                lines.append(f"Ассистент: {content}")
-            else:
-                lines.append(f"{role}: {content}")
-        dialog_text = "\n".join(lines)
-        prev = (existing_summary or "").strip()
-        if prev:
-            user_block = (
-                "Уже сохранено краткое содержание более раннего диалога "
-                "(оно остаётся в памяти; не переписывай его и не дублируй целиком):\n\n"
-                f"{prev}\n\n"
-                "Новый фрагмент диалога, который нужно учесть:\n\n"
-                f"{dialog_text}\n\n"
-                "Сформулируй только краткое дополнение к резюме по этому новому фрагменту "
-                "(факты, договорённости, открытые вопросы). Без вступлений."
+    def _trim_branching_linear(self) -> None:
+        if self._state.strategy != ContextStrategyKind.BRANCHING:
+            return
+        if self._state.branching_split:
+            return
+        while len(self._state.messages) > self._history_max_messages:
+            self._state.messages.pop(0)
+
+    def _trim_branching_after_split(self) -> None:
+        """
+        Обрезка только активной ветки. Общий checkpoint (branch_prefix) не трогаем —
+        иначе длинная сессия в другой ветке «съедала» бы историю до разветвления
+        и ломала бы контекст при возврате на первую ветку.
+        """
+        if self._state.strategy != ContextStrategyKind.BRANCHING:
+            return
+        if not self._state.branching_split:
+            return
+        active = self._state.active_branch
+        branch = self._state.branches.setdefault(active, [])
+        while len(branch) > self._history_max_messages:
+            branch.pop(0)
+
+    def _build_messages_for_api(self) -> list[dict[str, str]]:
+        s = self._state.strategy
+        if s == ContextStrategyKind.SLIDING_WINDOW:
+            return build_sliding_api_messages(self._state.messages)
+        if s == ContextStrategyKind.STICKY_FACTS:
+            return build_sticky_facts_api_messages(
+                self._state.facts, self._state.messages
             )
-            system_prompt = (
-                "Ты помогаешь вести накопительное резюме беседы. "
-                "Пользователь уже хранит старое резюме; твой ответ — только новый блок "
-                "про последний фрагмент, на русском, без повторения старого текста."
-            )
-        else:
-            user_block = dialog_text
-            system_prompt = (
-                "Сожми следующий фрагмент диалога в краткое резюме на русском. "
-                "Сохрани факты, вопросы, договорённости и нерешённые моменты. "
-                "Ответь только текстом резюме, без вступлений."
-            )
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_block},
-        ]
-        text, _ = self._complete_chat(access_token, model, msgs)
-        return text
+        return build_branching_api_messages(self._state)
 
     def _complete_chat(
         self,
@@ -751,9 +733,52 @@ class LLMAgent:
         except RuntimeError as e:
             return RunResult(text=str(e))
 
-        self._messages.append({"role": "user", "content": text})
-        self._compact_stored_context(access_token, model)
-        self._trim_messages()
+        facts_backup = dict(self._state.facts)
+
+        if (
+            self._state.strategy == ContextStrategyKind.BRANCHING
+            and self._state.branching_split
+        ):
+            self._state.branches.setdefault(self._state.active_branch, []).append(
+                {"role": "user", "content": text}
+            )
+        else:
+            self._state.messages.append({"role": "user", "content": text})
+
+        if self._state.strategy in (
+            ContextStrategyKind.SLIDING_WINDOW,
+            ContextStrategyKind.STICKY_FACTS,
+        ):
+            trim_messages(self._state.messages, RECENT_MESSAGE_WINDOW)
+
+        if self._state.strategy == ContextStrategyKind.STICKY_FACTS:
+            try:
+
+                def _complete_facts(msgs: list[dict[str, str]]) -> str:
+                    r, _ = self._complete_chat(access_token, model, msgs)
+                    return r
+
+                self._state.facts = update_facts_with_llm(
+                    _complete_facts,
+                    self._state.facts,
+                    self._state.messages,
+                    text,
+                )
+            except (
+                OSError,
+                urllib.error.HTTPError,
+                RuntimeError,
+                KeyError,
+                TypeError,
+                json.JSONDecodeError,
+            ):
+                self._rollback_last_user()
+                self._state.facts = facts_backup
+                return RunResult(
+                    text="Не удалось обновить блок facts (ошибка сети или API)."
+                )
+
+        self._trim_branching_linear()
 
         user_turn_tokens = self._tokens_count(access_token, model, [text])
         api_messages = self._build_messages_for_api()
@@ -764,8 +789,8 @@ class LLMAgent:
         try:
             reply, response_json = self._complete_chat(access_token, model, api_messages)
         except urllib.error.HTTPError as e:
-            if self._messages and self._messages[-1].get("role") == "user":
-                self._messages.pop()
+            self._rollback_last_user()
+            self._state.facts = facts_backup
             err_body = e.read().decode("utf-8", errors="replace")
             detail = err_body
             try:
@@ -777,13 +802,13 @@ class LLMAgent:
                 pass
             return RunResult(text=f"Ошибка HTTP {e.code}: {detail[:2000]}")
         except OSError as e:
-            if self._messages and self._messages[-1].get("role") == "user":
-                self._messages.pop()
+            self._rollback_last_user()
+            self._state.facts = facts_backup
             msg = f"Сетевая ошибка: {e}"
             return RunResult(text=msg + _ssl_troubleshooting_hint(e))
         except (json.JSONDecodeError, KeyError, IndexError, TypeError) as e:
-            if self._messages and self._messages[-1].get("role") == "user":
-                self._messages.pop()
+            self._rollback_last_user()
+            self._state.facts = facts_backup
             return RunResult(text=f"Не удалось разобрать ответ API: {e}")
 
         usage = _parse_usage_from_completion(response_json)
@@ -795,8 +820,22 @@ class LLMAgent:
             precached_prompt_tokens=usage["precached_prompt_tokens"],
             prompt_tokens_usage=usage["prompt_tokens"],
         )
-        self._messages.append({"role": "assistant", "content": reply})
-        self._compact_stored_context(access_token, model)
-        self._trim_messages()
+        if (
+            self._state.strategy == ContextStrategyKind.BRANCHING
+            and self._state.branching_split
+        ):
+            self._state.branches.setdefault(self._state.active_branch, []).append(
+                {"role": "assistant", "content": reply}
+            )
+        else:
+            self._state.messages.append({"role": "assistant", "content": reply})
+
+        if self._state.strategy in (
+            ContextStrategyKind.SLIDING_WINDOW,
+            ContextStrategyKind.STICKY_FACTS,
+        ):
+            trim_messages(self._state.messages, RECENT_MESSAGE_WINDOW)
+
+        self._trim_branching_after_split()
         self._persist_history()
         return RunResult(text=reply, stats=stats)
