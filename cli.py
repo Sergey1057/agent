@@ -26,6 +26,21 @@ def _strategy_from_arg(raw: str | None) -> ContextStrategyKind | None:
     return ContextStrategyKind(raw.strip())
 
 
+def _format_memory_proposals(items: list[dict[str, str]]) -> str:
+    if not items:
+        return ""
+    lines = ["Найдены кандидаты для памяти:"]
+    for i, it in enumerate(items, start=1):
+        mem_type = it.get("type", "")
+        section = it.get("section", "")
+        key = it.get("key", "")
+        value = it.get("value", "")
+        target = mem_type if not section else f"{mem_type}.{section}"
+        lines.append(f"  {i}) {target} -> {key}: {value}")
+    lines.append("Сохранить? [y/N]")
+    return "\n".join(lines)
+
+
 def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
     """
     Обрабатывает команды, начинающиеся с /.
@@ -38,10 +53,19 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
     cmd = parts[0].lower()
     arg = parts[1].strip() if len(parts) > 1 else ""
 
+    # Алиас: /show memory -> /memory show
+    if cmd == "/show" and arg.lower() == "memory":
+        cmd = "/memory"
+        arg = "show"
+
     if cmd in ("/help", "/?"):
         return (
             "Команды:\n"
             "  /strategy [sliding_window|sticky_facts|branching] — текущая или смена стратегии\n"
+            "  /memory show — показать все типы памяти\n"
+            "  /memory put short_term <key> <value> — явное сохранение в краткосрочную память\n"
+            "  /memory put working <key> <value> — явное сохранение в рабочую память\n"
+            "  /memory put long_term <profile|decisions|knowledge> <key> <value> — явное сохранение в долговременную\n"
             "  /facts — показать блок facts (sticky_facts)\n"
             "  /fact ключ остальное_текстом_значение — добавить/обновить факт вручную\n"
             "  /split или /checkpoint — checkpoint и две ветки (только branching)\n"
@@ -61,6 +85,46 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
 
     if cmd == "/facts":
         return agent.format_facts_lines()
+
+    if cmd == "/memory":
+        if not arg:
+            return (
+                "Формат:\n"
+                "  /memory show\n"
+                "  /memory put short_term <key> <value>\n"
+                "  /memory put working <key> <value>\n"
+                "  /memory put long_term <profile|decisions|knowledge> <key> <value>"
+            )
+        mem_parts = arg.split(maxsplit=4)
+        sub = mem_parts[0].lower()
+        if sub == "show":
+            return agent.format_memory_lines()
+        if sub != "put":
+            return "Подкоманда /memory должна быть show или put."
+        if len(mem_parts) < 4:
+            return "Недостаточно аргументов: /memory put <type> ..."
+        mem_type = mem_parts[1]
+        if mem_type in ("long_term", "long"):
+            if len(mem_parts) < 5:
+                return (
+                    "Для long_term нужно: /memory put long_term "
+                    "<profile|decisions|knowledge> <key> <value>"
+                )
+            section = mem_parts[2]
+            key = mem_parts[3]
+            value = mem_parts[4]
+            ok, err = agent.save_memory_entry(
+                "long_term", key, value, long_term_section=section
+            )
+            if not ok:
+                return f"Не удалось сохранить: {err}"
+            return f"Сохранено в long_term.{section}: {key}"
+        key = mem_parts[2]
+        value = mem_parts[3] if len(mem_parts) == 4 else mem_parts[3] + " " + mem_parts[4]
+        ok, err = agent.save_memory_entry(mem_type, key, value)
+        if not ok:
+            return f"Не удалось сохранить: {err}"
+        return f"Сохранено в {mem_type}: {key}"
 
     if cmd == "/fact":
         if not arg:
@@ -149,6 +213,18 @@ def main() -> None:
                 print(out)
                 print()
                 continue
+        proposals = agent.propose_memory_entries(user)
+        if proposals:
+            print(_format_memory_proposals(proposals))
+            choice = input("> ").strip().lower()
+            if choice in ("y", "yes", "д", "да"):
+                saved, errors = agent.apply_memory_proposals(proposals)
+                print(f"Сохранено в память: {saved}")
+                if errors:
+                    print("Ошибки сохранения:")
+                    for e in errors:
+                        print(f"  - {e}")
+                print()
         _print_run_result(agent.run(user))
         print()
 

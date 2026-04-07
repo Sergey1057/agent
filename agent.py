@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import ssl
 import time
 import urllib.error
@@ -21,6 +22,7 @@ from typing import Any
 
 import certifi
 
+from memory_store import AssistantMemoryStore
 from context_strategies import (
     RECENT_MESSAGE_WINDOW,
     ContextStrategyKind,
@@ -439,6 +441,9 @@ class LLMAgent:
     Контекст задаётся стратегией (см. context_strategies): sliding_window и sticky_facts
     хранят последние N реплик (по умолчанию 6 = три пары user/assistant; N задаётся
     LLM_AGENT_RECENT_MESSAGES), branching — checkpoint и две независимые ветки.
+    Память разделена на три слоя (см. memory_store): short_term, working, long_term.
+    working/long_term попадают в запрос как системные блоки; записи в них делаются явно
+    через save_memory_entry (CLI: /memory put ...).
     """
 
     def __init__(
@@ -461,6 +466,8 @@ class LLMAgent:
                     self._state.strategy = self._coerce_strategy(env_s)
                 except ValueError:
                     pass
+        self._memory = AssistantMemoryStore()
+        self._sync_short_term_memory(decay_notes=False)
 
     @staticmethod
     def _coerce_strategy(val: ContextStrategyKind | str) -> ContextStrategyKind:
@@ -522,11 +529,139 @@ class LLMAgent:
         lines = [f"  {k}: {v}" for k, v in sorted(self._state.facts.items())]
         return "\n".join(lines)
 
+    def save_memory_entry(
+        self,
+        memory_type: str,
+        key: str,
+        value: str,
+        *,
+        long_term_section: str = "",
+    ) -> tuple[bool, str]:
+        """
+        Явное сохранение в выбранный тип памяти:
+        - short_term: временные заметки в текущем диалоге
+        - working: данные текущей задачи
+        - long_term: профиль/решения/знания (нужна секция)
+        """
+        mt = (memory_type or "").strip().lower()
+        if mt in ("short", "short_term"):
+            return self._memory.put_short_note(key, value)
+        if mt in ("working", "working_memory"):
+            return self._memory.put_working(key, value)
+        if mt in ("long", "long_term"):
+            return self._memory.put_long_term(long_term_section, key, value)
+        return (
+            False,
+            "Неизвестный тип памяти. Используйте: short_term, working, long_term.",
+        )
+
+    def format_memory_lines(self) -> str:
+        return self._memory.format_summary()
+
+    def propose_memory_entries(self, user_message: str) -> list[dict[str, str]]:
+        """
+        Простая эвристика маршрутизации памяти.
+        Ничего не сохраняет — только предлагает кандидаты.
+        """
+        text = (user_message or "").strip()
+        low = text.lower()
+        out: list[dict[str, str]] = []
+
+        def add(mem_type: str, key: str, value: str, section: str = "") -> None:
+            out.append(
+                {
+                    "type": mem_type,
+                    "section": section,
+                    "key": key.strip(),
+                    "value": value.strip(),
+                }
+            )
+
+        m = re.search(r"(?:моя|my)\s+цель\s*[:=-]\s*(.+)", text, flags=re.IGNORECASE)
+        if m:
+            add("working", "goal", m.group(1))
+        elif low.startswith("цель ") or low.startswith("goal "):
+            add("working", "goal", text.split(" ", 1)[1] if " " in text else text)
+
+        m = re.search(
+            r"(?:ограничени[ея]|constraint[s]?)\s*[:=-]\s*(.+)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if m:
+            add("working", "constraints", m.group(1))
+
+        m = re.search(
+            r"(?:дедлайн|deadline)\s*[:=-]?\s*(.+)", text, flags=re.IGNORECASE
+        )
+        if m:
+            add("working", "deadline", m.group(1))
+
+        m = re.search(r"я\s+болею\s+за\s+(.+)", text, flags=re.IGNORECASE)
+        if m:
+            add("long_term", "favorite_team", m.group(1), section="profile")
+
+        m = re.search(
+            r"(?:предпочитаю|люблю|мой язык)\s+(.+)", text, flags=re.IGNORECASE
+        )
+        if m:
+            add("long_term", "preference", m.group(1), section="profile")
+
+        m = re.search(
+            r"(?:решили|договорились)\s*[:,-]?\s*(.+)", text, flags=re.IGNORECASE
+        )
+        if m:
+            add("long_term", "latest_decision", m.group(1), section="decisions")
+
+        uniq: list[dict[str, str]] = []
+        seen: set[tuple[str, str, str, str]] = set()
+        for item in out:
+            signature = (
+                item["type"],
+                item["section"],
+                item["key"],
+                item["value"],
+            )
+            if signature in seen:
+                continue
+            seen.add(signature)
+            uniq.append(item)
+        return uniq
+
+    def apply_memory_proposals(
+        self, proposals: list[dict[str, str]]
+    ) -> tuple[int, list[str]]:
+        """Сохраняет предложенные записи и возвращает (кол-во, ошибки)."""
+        saved = 0
+        errors: list[str] = []
+        for item in proposals:
+            mem_type = item.get("type", "")
+            section = item.get("section", "")
+            key = item.get("key", "")
+            value = item.get("value", "")
+            ok, err = self.save_memory_entry(
+                mem_type, key, value, long_term_section=section
+            )
+            if ok:
+                saved += 1
+            else:
+                errors.append(err)
+        return saved, errors
+
+    def _sync_short_term_memory(self, *, decay_notes: bool = True) -> None:
+        """Краткосрочная память: синхронизируется с текущим диалогом."""
+        dialog = flatten_messages_for_export(self._state)
+        try:
+            self._memory.update_short_term_dialog(dialog, decay_notes=decay_notes)
+        except OSError:
+            pass
+
     def _persist_history(self) -> None:
         try:
             save_unified_state(self._history_path, self._state)
         except OSError:
             pass
+        self._sync_short_term_memory()
 
     def _rollback_last_user(self) -> None:
         if (
@@ -564,14 +699,17 @@ class LLMAgent:
             branch.pop(0)
 
     def _build_messages_for_api(self) -> list[dict[str, str]]:
+        out: list[dict[str, str]] = []
+        out.extend(self._memory.build_memory_system_messages())
         s = self._state.strategy
         if s == ContextStrategyKind.SLIDING_WINDOW:
-            return build_sliding_api_messages(self._state.messages)
+            out.extend(build_sliding_api_messages(self._state.messages))
+            return out
         if s == ContextStrategyKind.STICKY_FACTS:
-            return build_sticky_facts_api_messages(
-                self._state.facts, self._state.messages
-            )
-        return build_branching_api_messages(self._state)
+            out.extend(build_sticky_facts_api_messages(self._state.facts, self._state.messages))
+            return out
+        out.extend(build_branching_api_messages(self._state))
+        return out
 
     def _complete_chat(
         self,
