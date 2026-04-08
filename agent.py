@@ -23,6 +23,7 @@ from typing import Any
 import certifi
 
 from memory_store import AssistantMemoryStore
+from user_profile import UserProfileStore
 from context_strategies import (
     RECENT_MESSAGE_WINDOW,
     ContextStrategyKind,
@@ -435,6 +436,28 @@ class RunResult:
     stats: TokenStats | None = None
 
 
+def _merge_leading_system_messages(
+    messages: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """
+    GigaChat отклоняет несколько подряд system: «system message must be the first message».
+    Склеиваем все ведущие system в одно, затем идут остальные роли.
+    """
+    if not messages:
+        return []
+    parts: list[str] = []
+    i = 0
+    while i < len(messages) and messages[i].get("role") == "system":
+        parts.append(str(messages[i].get("content", "")))
+        i += 1
+    out: list[dict[str, str]] = []
+    merged = "\n\n".join(p.strip() for p in parts if p.strip())
+    if merged:
+        out.append({"role": "system", "content": merged})
+    out.extend(messages[i:])
+    return out
+
+
 class LLMAgent:
     """
     Сущность «агент»: принимает пользовательский запрос, вызывает LLM, возвращает RunResult.
@@ -442,6 +465,8 @@ class LLMAgent:
     хранят последние N реплик (по умолчанию 6 = три пары user/assistant; N задаётся
     LLM_AGENT_RECENT_MESSAGES), branching — checkpoint и две независимые ветки.
     Память разделена на три слоя (см. memory_store): short_term, working, long_term.
+    Персонализация (см. user_profile): несколько именованных профилей, активный задаёт
+    предпочтения стиля/формата/ограничений и подмешивается в запрос перед блоками памяти.
     working/long_term попадают в запрос как системные блоки; записи в них делаются явно
     через save_memory_entry (CLI: /memory put ...).
     """
@@ -467,6 +492,7 @@ class LLMAgent:
                 except ValueError:
                     pass
         self._memory = AssistantMemoryStore()
+        self._user_profile = UserProfileStore()
         self._sync_short_term_memory(decay_notes=False)
 
     @staticmethod
@@ -557,6 +583,33 @@ class LLMAgent:
 
     def format_memory_lines(self) -> str:
         return self._memory.format_summary()
+
+    def format_user_profile_lines(self) -> str:
+        return self._user_profile.format_lines()
+
+    def format_user_profile_list_lines(self) -> str:
+        return self._user_profile.format_list_lines()
+
+    def set_user_profile_field(self, name: str, value: str) -> tuple[bool, str]:
+        return self._user_profile.set_field(name, value)
+
+    def set_user_profile_fields(self, assignments: dict[str, str]) -> tuple[bool, str]:
+        return self._user_profile.set_fields(assignments)
+
+    def activate_user_profile(self, profile_id: str) -> tuple[bool, str]:
+        return self._user_profile.activate(profile_id)
+
+    def create_user_profile(
+        self, profile_id: str, *, copy_from_active: bool
+    ) -> tuple[bool, str]:
+        template = self._user_profile.profile if copy_from_active else None
+        return self._user_profile.create_profile(profile_id, template=template)
+
+    def duplicate_user_profile(self, profile_id: str) -> tuple[bool, str]:
+        return self._user_profile.duplicate_profile(profile_id)
+
+    def delete_user_profile(self, profile_id: str) -> tuple[bool, str]:
+        return self._user_profile.delete_profile(profile_id)
 
     def propose_memory_entries(self, user_message: str) -> list[dict[str, str]]:
         """
@@ -700,16 +753,19 @@ class LLMAgent:
 
     def _build_messages_for_api(self) -> list[dict[str, str]]:
         out: list[dict[str, str]] = []
+        out.extend(self._user_profile.build_system_messages())
         out.extend(self._memory.build_memory_system_messages())
         s = self._state.strategy
         if s == ContextStrategyKind.SLIDING_WINDOW:
             out.extend(build_sliding_api_messages(self._state.messages))
-            return out
+            return _merge_leading_system_messages(out)
         if s == ContextStrategyKind.STICKY_FACTS:
-            out.extend(build_sticky_facts_api_messages(self._state.facts, self._state.messages))
-            return out
+            out.extend(
+                build_sticky_facts_api_messages(self._state.facts, self._state.messages)
+            )
+            return _merge_leading_system_messages(out)
         out.extend(build_branching_api_messages(self._state))
-        return out
+        return _merge_leading_system_messages(out)
 
     def _complete_chat(
         self,

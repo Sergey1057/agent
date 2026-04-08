@@ -10,6 +10,25 @@ import argparse
 
 from agent import LLMAgent, RunResult, clear_history_file
 from context_strategies import ContextStrategyKind
+from user_profile import parse_profile_set_rest
+
+
+def _single_profile_id(rest: str) -> tuple[str | None, str | None]:
+    """
+    Имя профиля для /profile new и /profile copy — одно слово без пробелов,
+    иначе весь хвост ошибочно становится имени (как в «new name Сергей style …»).
+    """
+    s = (rest or "").strip()
+    if not s:
+        return None, None
+    parts = s.split()
+    if len(parts) > 1:
+        return None, (
+            "Имя профиля — одно слово без пробелов. Поля задаются отдельно, например:\n"
+            "  /profile new Сергей\n"
+            "  /profile set name Сергей style веселый format json constraints не более 100 символов"
+        )
+    return parts[0], None
 
 
 def _print_run_result(result: RunResult) -> None:
@@ -66,6 +85,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /memory put short_term <key> <value> — явное сохранение в краткосрочную память\n"
             "  /memory put working <key> <value> — явное сохранение в рабочую память\n"
             "  /memory put long_term <profile|decisions|knowledge> <key> <value> — явное сохранение в долговременную\n"
+            "  /profile show | list — профили; set — поля активного; use/new/copy/delete — сценарии\n"
             "  /facts — показать блок facts (sticky_facts)\n"
             "  /fact ключ остальное_текстом_значение — добавить/обновить факт вручную\n"
             "  /split или /checkpoint — checkpoint и две ветки (только branching)\n"
@@ -85,6 +105,79 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
 
     if cmd == "/facts":
         return agent.format_facts_lines()
+
+    if cmd == "/profile":
+        if not arg:
+            return (
+                "Формат:\n"
+                "  /profile show — активный профиль\n"
+                "  /profile list — все сохранённые профили\n"
+                "  /profile set <поле> <значение> — правки только активного профиля\n"
+                "  /profile use <имя>  или  /profile switch <имя> — сменить активный\n"
+                "  /profile new <имя> — пустой профиль (имя — одно слово); поля — через /profile set\n"
+                "  /profile copy <имя> — копия активного под новым именем (одно слово)\n"
+                "  /profile delete <имя> — удалить (не единственный)\n"
+                "Поля: display_name, style, format, constraints, extra.<ключ>\n"
+                "Несколько полей в строке: … style … format … constraints …"
+            )
+        tw = arg.split(maxsplit=1)
+        sub = tw[0].strip().lower()
+        rest = tw[1].strip() if len(tw) > 1 else ""
+
+        if sub == "show":
+            return agent.format_user_profile_lines()
+        if sub == "list":
+            return agent.format_user_profile_list_lines()
+        if sub in ("use", "switch"):
+            if not rest:
+                return "Формат: /profile use <имя>"
+            ok, err = agent.activate_user_profile(rest)
+            if not ok:
+                return err
+            return f"Активный профиль: «{rest}»"
+        if sub in ("new", "add"):
+            if not rest:
+                return "Формат: /profile new <имя> — имя одним словом, затем /profile set …"
+            pid, err = _single_profile_id(rest)
+            if err:
+                return err
+            assert pid is not None
+            ok, err = agent.create_user_profile(pid, copy_from_active=False)
+            if not ok:
+                return err
+            return f"Создан и активирован профиль «{pid}»"
+        if sub in ("copy", "duplicate"):
+            if not rest:
+                return "Формат: /profile copy <имя>"
+            pid, err = _single_profile_id(rest)
+            if err:
+                return err
+            assert pid is not None
+            ok, err = agent.duplicate_user_profile(pid)
+            if not ok:
+                return err
+            return f"Скопирован активный профиль в «{pid}», он активен"
+        if sub in ("delete", "rm"):
+            if not rest:
+                return "Формат: /profile delete <имя>"
+            ok, err = agent.delete_user_profile(rest)
+            if not ok:
+                return err
+            return f"Профиль «{rest}» удалён"
+        if sub == "set":
+            triple = arg.split(maxsplit=2)
+            if len(triple) < 3:
+                return "Формат: /profile set <поле> <значение>"
+            field_name, value = triple[1].strip(), triple[2]
+            assignments, parse_err = parse_profile_set_rest(field_name, value)
+            if parse_err:
+                return parse_err
+            ok, err = agent.set_user_profile_fields(assignments)
+            if not ok:
+                return err
+            keys = ", ".join(sorted(assignments.keys()))
+            return f"Профиль обновлён: {keys}"
+        return "Неизвестная подкоманда /profile. См. /profile без аргументов."
 
     if cmd == "/memory":
         if not arg:
