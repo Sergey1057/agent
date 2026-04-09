@@ -91,6 +91,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /split или /checkpoint — checkpoint и две ветки (только branching)\n"
             "  /switch или /checkout <branch_a|branch_b> — смена активной ветки\n"
             "  /status — состояние ветвления\n"
+            "  /task ... — состояние задачи как FSM (этап/шаг/ожидаемое действие, pause/resume)\n"
             "  /help — эта справка"
         )
 
@@ -251,6 +252,70 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
 
     if cmd == "/status":
         return agent.branching_status_line()
+
+    if cmd == "/task":
+        if not arg:
+            return (
+                "Формат:\n"
+                "  /task status\n"
+                "  /task start [шаг] [| ожидаемое действие]\n"
+                "  /task stage <planning|execution|validation|done>\n"
+                "  /task step <текущий шаг>\n"
+                "  /task expect <ожидаемое действие>\n"
+                "  /task next\n"
+                "  /task pause\n"
+                "  /task resume"
+            )
+        tw = arg.split(maxsplit=1)
+        sub = tw[0].strip().lower()
+        rest = tw[1].strip() if len(tw) > 1 else ""
+        if sub == "status":
+            return agent.format_task_state_lines()
+        if sub == "start":
+            step = ""
+            expected = ""
+            if rest:
+                if "|" in rest:
+                    left, right = rest.split("|", 1)
+                    step = left.strip()
+                    expected = right.strip()
+                else:
+                    step = rest
+            agent.task_reset(step=step, expected_action=expected)
+            return agent.format_task_state_lines()
+        if sub == "stage":
+            if not rest:
+                return "Формат: /task stage <planning|execution|validation|done>"
+            ok, err = agent.task_set_stage(rest)
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        if sub == "step":
+            if not rest:
+                return "Формат: /task step <текущий шаг>"
+            _, _ = agent.task_set_step(rest)
+            return agent.format_task_state_lines()
+        if sub == "expect":
+            if not rest:
+                return "Формат: /task expect <ожидаемое действие>"
+            _, _ = agent.task_set_expected_action(rest)
+            return agent.format_task_state_lines()
+        if sub in ("next", "advance"):
+            ok, err = agent.task_advance()
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        if sub == "pause":
+            ok, err = agent.task_pause()
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        if sub == "resume":
+            ok, err = agent.task_resume()
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        return "Неизвестная подкоманда /task. Используйте: status/start/stage/step/expect/next/pause/resume."
 
     # Не наша команда — пусть уйдёт в модель (например /path/to/file)
     return None

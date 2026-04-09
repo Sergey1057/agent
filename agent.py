@@ -18,7 +18,7 @@ import urllib.request
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import certifi
 
@@ -49,6 +49,7 @@ _AGENT_DIR = Path(__file__).resolve().parent
 
 DEFAULT_HISTORY_FILENAME = "chat_history.json"
 DEFAULT_HISTORY_MAX_MESSAGES = 200
+TASK_STATE_FILENAME = "task_state.json"
 
 # GigaChat: OAuth и REST (см. документацию Сбера)
 GIGACHAT_OAUTH_URL = "https://ngw.devices.sberbank.ru:9443/api/v2/oauth"
@@ -436,6 +437,152 @@ class RunResult:
     stats: TokenStats | None = None
 
 
+TaskStage = Literal["planning", "execution", "validation", "done"]
+_TASK_STAGES: tuple[TaskStage, ...] = ("planning", "execution", "validation", "done")
+
+
+@dataclass
+class TaskState:
+    stage: TaskStage = "planning"
+    current_step: str = ""
+    expected_action: str = ""
+    paused: bool = False
+
+
+class TaskStateMachine:
+    """Формализованное состояние задачи: этап, шаг, ожидаемое действие."""
+
+    def __init__(self, storage_path: Path) -> None:
+        self._path = storage_path
+        self.state = TaskState()
+        self._load()
+
+    def _read_json(self) -> Any:
+        if not self._path.is_file():
+            return None
+        try:
+            return json.loads(self._path.read_text(encoding="utf-8-sig"))
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def _write_json(self, payload: dict[str, Any]) -> None:
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self._path.with_name(self._path.name + ".tmp")
+        tmp.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        tmp.replace(self._path)
+
+    def _load(self) -> None:
+        data = self._read_json()
+        if not isinstance(data, dict):
+            self.state = TaskState()
+            return
+        raw_stage = str(data.get("stage") or "planning").strip().lower()
+        stage: TaskStage = "planning"
+        if raw_stage in _TASK_STAGES:
+            stage = raw_stage  # type: ignore[assignment]
+        self.state = TaskState(
+            stage=stage,
+            current_step=str(data.get("current_step") or "").strip(),
+            expected_action=str(data.get("expected_action") or "").strip(),
+            paused=bool(data.get("paused", False)),
+        )
+
+    def persist(self) -> None:
+        self._write_json(
+            {
+                "version": 1,
+                "type": "task_state",
+                "stage": self.state.stage,
+                "current_step": self.state.current_step,
+                "expected_action": self.state.expected_action,
+                "paused": self.state.paused,
+            }
+        )
+
+    def _next_stage(self) -> TaskStage:
+        idx = _TASK_STAGES.index(self.state.stage)
+        if idx >= len(_TASK_STAGES) - 1:
+            return "done"
+        return _TASK_STAGES[idx + 1]
+
+    def set_stage(self, stage: str) -> tuple[bool, str]:
+        val = (stage or "").strip().lower()
+        if val not in _TASK_STAGES:
+            return False, "Этап должен быть одним из: planning, execution, validation, done."
+        self.state.stage = val  # type: ignore[assignment]
+        self.persist()
+        return True, ""
+
+    def set_step(self, step: str) -> tuple[bool, str]:
+        self.state.current_step = (step or "").strip()
+        self.persist()
+        return True, ""
+
+    def set_expected_action(self, action: str) -> tuple[bool, str]:
+        self.state.expected_action = (action or "").strip()
+        self.persist()
+        return True, ""
+
+    def advance(self) -> tuple[bool, str]:
+        if self.state.stage == "done":
+            return False, "Задача уже в состоянии done."
+        self.state.stage = self._next_stage()
+        if self.state.stage == "done":
+            self.state.expected_action = "Финализировать результат и закрыть задачу."
+        self.persist()
+        return True, ""
+
+    def pause(self) -> tuple[bool, str]:
+        if self.state.paused:
+            return False, "Задача уже на паузе."
+        self.state.paused = True
+        self.persist()
+        return True, ""
+
+    def resume(self) -> tuple[bool, str]:
+        if not self.state.paused:
+            return False, "Задача не на паузе."
+        self.state.paused = False
+        self.persist()
+        return True, ""
+
+    def reset(self, *, step: str = "", expected_action: str = "") -> None:
+        self.state = TaskState(
+            stage="planning",
+            current_step=(step or "").strip(),
+            expected_action=(expected_action or "").strip(),
+            paused=False,
+        )
+        self.persist()
+
+    def format_lines(self) -> str:
+        status = "paused" if self.state.paused else "active"
+        lines = [
+            "Состояние задачи (FSM):",
+            f"  этап: {self.state.stage}",
+            f"  текущий шаг: {self.state.current_step or '(не задан)'}",
+            f"  ожидаемое действие: {self.state.expected_action or '(не задано)'}",
+            f"  статус: {status}",
+        ]
+        return "\n".join(lines)
+
+    def build_system_message(self) -> list[dict[str, str]]:
+        status = "paused" if self.state.paused else "active"
+        content = (
+            "Формализованное состояние задачи (используй как конечный автомат):\n"
+            f"- этап: {self.state.stage}\n"
+            f"- текущий шаг: {self.state.current_step or '(не задан)'}\n"
+            f"- ожидаемое действие: {self.state.expected_action or '(не задано)'}\n"
+            f"- статус: {status}\n"
+            "- Допустимые этапы: planning -> execution -> validation -> done.\n"
+            "- Если состояние resumed после паузы, продолжай с текущего шага без повторного пересказа прошлых объяснений."
+        )
+        return [{"role": "system", "content": content}]
+
+
 def _merge_leading_system_messages(
     messages: list[dict[str, str]],
 ) -> list[dict[str, str]]:
@@ -493,6 +640,9 @@ class LLMAgent:
                     pass
         self._memory = AssistantMemoryStore()
         self._user_profile = UserProfileStore()
+        self._task_state = TaskStateMachine(
+            self._memory._resolve_memory_dir() / TASK_STATE_FILENAME
+        )
         self._sync_short_term_memory(decay_notes=False)
 
     @staticmethod
@@ -589,6 +739,30 @@ class LLMAgent:
 
     def format_user_profile_list_lines(self) -> str:
         return self._user_profile.format_list_lines()
+
+    def format_task_state_lines(self) -> str:
+        return self._task_state.format_lines()
+
+    def task_set_stage(self, stage: str) -> tuple[bool, str]:
+        return self._task_state.set_stage(stage)
+
+    def task_set_step(self, step: str) -> tuple[bool, str]:
+        return self._task_state.set_step(step)
+
+    def task_set_expected_action(self, action: str) -> tuple[bool, str]:
+        return self._task_state.set_expected_action(action)
+
+    def task_advance(self) -> tuple[bool, str]:
+        return self._task_state.advance()
+
+    def task_pause(self) -> tuple[bool, str]:
+        return self._task_state.pause()
+
+    def task_resume(self) -> tuple[bool, str]:
+        return self._task_state.resume()
+
+    def task_reset(self, *, step: str = "", expected_action: str = "") -> None:
+        self._task_state.reset(step=step, expected_action=expected_action)
 
     def set_user_profile_field(self, name: str, value: str) -> tuple[bool, str]:
         return self._user_profile.set_field(name, value)
@@ -753,6 +927,7 @@ class LLMAgent:
 
     def _build_messages_for_api(self) -> list[dict[str, str]]:
         out: list[dict[str, str]] = []
+        out.extend(self._task_state.build_system_message())
         out.extend(self._user_profile.build_system_messages())
         out.extend(self._memory.build_memory_system_messages())
         s = self._state.strategy
