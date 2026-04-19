@@ -92,6 +92,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /switch или /checkout <branch_a|branch_b> — смена активной ветки\n"
             "  /status — состояние ветвления\n"
             "  /task ... — состояние задачи как FSM (этап/шаг/ожидаемое действие, pause/resume)\n"
+            "  /invariants — инварианты проекта (архитектура, стек, бизнес-правила; отдельно от диалога)\n"
             "  /help — эта справка"
         )
 
@@ -316,6 +317,42 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 return err
             return agent.format_task_state_lines()
         return "Неизвестная подкоманда /task. Используйте: status/start/stage/step/expect/next/pause/resume."
+
+    if cmd == "/invariants":
+        if not arg:
+            return agent.format_invariants_lines()
+        tw = arg.split(maxsplit=1)
+        sub = tw[0].strip().lower()
+        rest = tw[1].strip() if len(tw) > 1 else ""
+
+        if sub in ("show", "list"):
+            return agent.format_invariants_lines()
+        if sub == "set":
+            triple = arg.split(maxsplit=2)
+            if len(triple) < 3:
+                return (
+                    "Формат: /invariants set <раздел> <текст>\n"
+                    "Разделы: architecture (arch), technical_decisions (tech), stack, "
+                    "business_rules (business), extra.<ключ>"
+                )
+            section, value = triple[1].strip(), triple[2]
+            ok, err = agent.set_invariant_section(section, value)
+            if not ok:
+                return err
+            return f"Инвариант обновлён: {section}"
+        if sub == "clear":
+            if not rest:
+                return "Формат: /invariants clear <раздел|all> — all очищает все разделы и extra"
+            ok, err = agent.clear_invariant_section(rest)
+            if not ok:
+                return err
+            return f"Очищено: {rest}"
+        return (
+            "Формат:\n"
+            "  /invariants | /invariants show — показать\n"
+            "  /invariants set <раздел> <текст>\n"
+            "  /invariants clear <раздел|all>"
+        )
 
     # Не наша команда — пусть уйдёт в модель (например /path/to/file)
     return None

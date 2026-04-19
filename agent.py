@@ -22,6 +22,7 @@ from typing import Any, Literal
 
 import certifi
 
+from invariants import InvariantsStore
 from memory_store import AssistantMemoryStore
 from user_profile import UserProfileStore
 from context_strategies import (
@@ -614,6 +615,8 @@ class LLMAgent:
     Память разделена на три слоя (см. memory_store): short_term, working, long_term.
     Персонализация (см. user_profile): несколько именованных профилей, активный задаёт
     предпочтения стиля/формата/ограничений и подмешивается в запрос перед блоками памяти.
+    Инварианты проекта (см. invariants): архитектура, решения, стек, бизнес-правила —
+    хранятся вне диалога и подмешиваются в системный контекст; агент обязан их соблюдать.
     working/long_term попадают в запрос как системные блоки; записи в них делаются явно
     через save_memory_entry (CLI: /memory put ...).
     """
@@ -639,9 +642,10 @@ class LLMAgent:
                 except ValueError:
                     pass
         self._memory = AssistantMemoryStore()
+        self._invariants = InvariantsStore(memory_dir=self._memory._dir)
         self._user_profile = UserProfileStore()
         self._task_state = TaskStateMachine(
-            self._memory._resolve_memory_dir() / TASK_STATE_FILENAME
+            self._memory._dir / TASK_STATE_FILENAME
         )
         self._sync_short_term_memory(decay_notes=False)
 
@@ -742,6 +746,15 @@ class LLMAgent:
 
     def format_task_state_lines(self) -> str:
         return self._task_state.format_lines()
+
+    def format_invariants_lines(self) -> str:
+        return self._invariants.format_lines()
+
+    def set_invariant_section(self, section: str, value: str) -> tuple[bool, str]:
+        return self._invariants.set_section(section, value)
+
+    def clear_invariant_section(self, section: str) -> tuple[bool, str]:
+        return self._invariants.clear_section(section)
 
     def task_set_stage(self, stage: str) -> tuple[bool, str]:
         return self._task_state.set_stage(stage)
@@ -928,6 +941,7 @@ class LLMAgent:
     def _build_messages_for_api(self) -> list[dict[str, str]]:
         out: list[dict[str, str]] = []
         out.extend(self._task_state.build_system_message())
+        out.extend(self._invariants.build_system_messages())
         out.extend(self._user_profile.build_system_messages())
         out.extend(self._memory.build_memory_system_messages())
         s = self._state.strategy
