@@ -438,8 +438,41 @@ class RunResult:
     stats: TokenStats | None = None
 
 
-TaskStage = Literal["planning", "execution", "validation", "done"]
-_TASK_STAGES: tuple[TaskStage, ...] = ("planning", "execution", "validation", "done")
+TaskStage = Literal["planning", "plan_approved", "execution", "validation", "done"]
+_TASK_STAGES: tuple[TaskStage, ...] = (
+    "planning",
+    "plan_approved",
+    "execution",
+    "validation",
+    "done",
+)
+_TASK_ALLOWED_TRANSITIONS: dict[TaskStage, tuple[TaskStage, ...]] = {
+    "planning": ("plan_approved",),
+    "plan_approved": ("execution",),
+    "execution": ("validation",),
+    "validation": ("done",),
+    "done": (),
+}
+_TASK_DEFAULT_EXPECTED_ACTION: dict[TaskStage, str] = {
+    "planning": "Сформировать и согласовать план.",
+    "plan_approved": "План утверждён. Перейти к реализации, когда пользователь подтвердит старт.",
+    "execution": "Реализовать согласованный план без пропуска валидации.",
+    "validation": "Проверить результат (тесты/проверки) перед финалом.",
+    "done": "Финализировать результат и закрыть задачу.",
+}
+_TASK_STAGE_GUIDANCE: dict[TaskStage, str] = {
+    "planning": (
+        "Только анализ и планирование. Нельзя переходить к реализации до состояния "
+        "plan_approved."
+    ),
+    "plan_approved": (
+        "План зафиксирован. Подготовка к реализации допустима, но сама реализация "
+        "начинается только в execution."
+    ),
+    "execution": "Только реализация. Финализировать результат до валидации нельзя.",
+    "validation": "Только валидация результата. Переход в done возможен после проверки.",
+    "done": "Только финальный ответ и закрытие задачи.",
+}
 
 
 @dataclass
@@ -451,6 +484,18 @@ class TaskState:
 
 
 class TaskStateMachine:
+    def _normalize_stage(self, stage: str) -> TaskStage | None:
+        val = (stage or "").strip().lower()
+        aliases = {
+            "approved_plan": "plan_approved",
+            "approved": "plan_approved",
+            "plan-approved": "plan_approved",
+        }
+        val = aliases.get(val, val)
+        if val in _TASK_STAGES:
+            return val  # type: ignore[return-value]
+        return None
+
     """Формализованное состояние задачи: этап, шаг, ожидаемое действие."""
 
     def __init__(self, storage_path: Path) -> None:
@@ -480,10 +525,7 @@ class TaskStateMachine:
         if not isinstance(data, dict):
             self.state = TaskState()
             return
-        raw_stage = str(data.get("stage") or "planning").strip().lower()
-        stage: TaskStage = "planning"
-        if raw_stage in _TASK_STAGES:
-            stage = raw_stage  # type: ignore[assignment]
+        stage = self._normalize_stage(str(data.get("stage") or "planning")) or "planning"
         self.state = TaskState(
             stage=stage,
             current_step=str(data.get("current_step") or "").strip(),
@@ -503,17 +545,33 @@ class TaskStateMachine:
             }
         )
 
-    def _next_stage(self) -> TaskStage:
-        idx = _TASK_STAGES.index(self.state.stage)
-        if idx >= len(_TASK_STAGES) - 1:
-            return "done"
-        return _TASK_STAGES[idx + 1]
+    def _next_stage(self) -> TaskStage | None:
+        allowed = _TASK_ALLOWED_TRANSITIONS[self.state.stage]
+        if not allowed:
+            return None
+        return allowed[0]
 
     def set_stage(self, stage: str) -> tuple[bool, str]:
-        val = (stage or "").strip().lower()
-        if val not in _TASK_STAGES:
-            return False, "Этап должен быть одним из: planning, execution, validation, done."
-        self.state.stage = val  # type: ignore[assignment]
+        val = self._normalize_stage(stage)
+        if val is None:
+            return (
+                False,
+                "Этап должен быть одним из: planning, plan_approved, execution, validation, done.",
+            )
+        current = self.state.stage
+        if val == current:
+            return True, ""
+        allowed = _TASK_ALLOWED_TRANSITIONS[current]
+        if val not in allowed:
+            next_s = ", ".join(allowed) if allowed else "(нет — задача завершена)"
+            return (
+                False,
+                f"Недопустимый переход: {current} -> {val}. "
+                f"Разрешён следующий переход: {next_s}.",
+            )
+        self.state.stage = val
+        if not self.state.expected_action.strip():
+            self.state.expected_action = _TASK_DEFAULT_EXPECTED_ACTION.get(val, "")
         self.persist()
         return True, ""
 
@@ -528,13 +586,10 @@ class TaskStateMachine:
         return True, ""
 
     def advance(self) -> tuple[bool, str]:
-        if self.state.stage == "done":
+        next_stage = self._next_stage()
+        if next_stage is None:
             return False, "Задача уже в состоянии done."
-        self.state.stage = self._next_stage()
-        if self.state.stage == "done":
-            self.state.expected_action = "Финализировать результат и закрыть задачу."
-        self.persist()
-        return True, ""
+        return self.set_stage(next_stage)
 
     def pause(self) -> tuple[bool, str]:
         if self.state.paused:
@@ -554,32 +609,46 @@ class TaskStateMachine:
         self.state = TaskState(
             stage="planning",
             current_step=(step or "").strip(),
-            expected_action=(expected_action or "").strip(),
+            expected_action=(
+                (expected_action or "").strip()
+                or _TASK_DEFAULT_EXPECTED_ACTION["planning"]
+            ),
             paused=False,
         )
         self.persist()
 
     def format_lines(self) -> str:
         status = "paused" if self.state.paused else "active"
+        allowed = _TASK_ALLOWED_TRANSITIONS[self.state.stage]
+        next_s = ", ".join(allowed) if allowed else "(нет — финальное состояние)"
         lines = [
             "Состояние задачи (FSM):",
             f"  этап: {self.state.stage}",
             f"  текущий шаг: {self.state.current_step or '(не задан)'}",
             f"  ожидаемое действие: {self.state.expected_action or '(не задано)'}",
             f"  статус: {status}",
+            f"  разрешённый следующий этап: {next_s}",
         ]
         return "\n".join(lines)
 
     def build_system_message(self) -> list[dict[str, str]]:
         status = "paused" if self.state.paused else "active"
+        allowed = _TASK_ALLOWED_TRANSITIONS[self.state.stage]
+        next_s = ", ".join(allowed) if allowed else "(нет)"
         content = (
             "Формализованное состояние задачи (используй как конечный автомат):\n"
             f"- этап: {self.state.stage}\n"
             f"- текущий шаг: {self.state.current_step or '(не задан)'}\n"
             f"- ожидаемое действие: {self.state.expected_action or '(не задано)'}\n"
             f"- статус: {status}\n"
-            "- Допустимые этапы: planning -> execution -> validation -> done.\n"
-            "- Если состояние resumed после паузы, продолжай с текущего шага без повторного пересказа прошлых объяснений."
+            f"- разрешённый следующий этап: {next_s}\n"
+            "- Допустимые этапы: planning -> plan_approved -> execution -> validation -> done.\n"
+            "- Запрещено перепрыгивать этапы или выполнять действия следующего этапа заранее.\n"
+            f"- Правило текущего этапа: {_TASK_STAGE_GUIDANCE[self.state.stage]}\n"
+            "- Если пользователь просит действие не из текущего этапа, откажись и попроси "
+            "перевести задачу в корректный этап через /task next или /task stage.\n"
+            "- Если состояние resumed после паузы, продолжай с текущего шага без повторного "
+            "пересказа прошлых объяснений."
         )
         return [{"role": "system", "content": content}]
 

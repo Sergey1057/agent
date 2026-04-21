@@ -91,7 +91,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /split или /checkpoint — checkpoint и две ветки (только branching)\n"
             "  /switch или /checkout <branch_a|branch_b> — смена активной ветки\n"
             "  /status — состояние ветвления\n"
-            "  /task ... — состояние задачи как FSM (этап/шаг/ожидаемое действие, pause/resume)\n"
+            "  /task ... — состояние задачи как FSM (этап/шаг/ожидаемое действие, pause/resume + явные переходы)\n"
             "  /invariants — инварианты проекта (архитектура, стек, бизнес-правила; отдельно от диалога)\n"
             "  /help — эта справка"
         )
@@ -260,10 +260,11 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 "Формат:\n"
                 "  /task status\n"
                 "  /task start [шаг] [| ожидаемое действие]\n"
-                "  /task stage <planning|execution|validation|done>\n"
+                "  /task stage <planning|plan_approved|execution|validation|done>\n"
                 "  /task step <текущий шаг>\n"
                 "  /task expect <ожидаемое действие>\n"
                 "  /task next\n"
+                "  /task approve-plan | start-execution | start-validation | finalize\n"
                 "  /task pause\n"
                 "  /task resume"
             )
@@ -286,7 +287,10 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             return agent.format_task_state_lines()
         if sub == "stage":
             if not rest:
-                return "Формат: /task stage <planning|execution|validation|done>"
+                return (
+                    "Формат: /task stage "
+                    "<planning|plan_approved|execution|validation|done>"
+                )
             ok, err = agent.task_set_stage(rest)
             if not ok:
                 return err
@@ -306,6 +310,26 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             if not ok:
                 return err
             return agent.format_task_state_lines()
+        if sub in ("approve-plan", "approve_plan", "approve"):
+            ok, err = agent.task_set_stage("plan_approved")
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        if sub in ("start-execution", "start_execution", "execute"):
+            ok, err = agent.task_set_stage("execution")
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        if sub in ("start-validation", "start_validation", "validate"):
+            ok, err = agent.task_set_stage("validation")
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
+        if sub in ("finalize", "finish"):
+            ok, err = agent.task_set_stage("done")
+            if not ok:
+                return err
+            return agent.format_task_state_lines()
         if sub == "pause":
             ok, err = agent.task_pause()
             if not ok:
@@ -316,7 +340,11 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             if not ok:
                 return err
             return agent.format_task_state_lines()
-        return "Неизвестная подкоманда /task. Используйте: status/start/stage/step/expect/next/pause/resume."
+        return (
+            "Неизвестная подкоманда /task. Используйте: "
+            "status/start/stage/step/expect/next/approve-plan/start-execution/"
+            "start-validation/finalize/pause/resume."
+        )
 
     if cmd == "/invariants":
         if not arg:
