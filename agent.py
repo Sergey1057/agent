@@ -1009,6 +1009,90 @@ class LLMAgent:
         except Exception as e:
             return {"status": "error", "error": f"MCP вызов не выполнен: {e}"}
 
+    def _call_scheduler_tool_via_mcp(
+        self, tool_name: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        async def _call() -> dict[str, Any]:
+            from mcp import ClientSession, StdioServerParameters
+            from mcp.client.stdio import stdio_client
+
+            server_script = str((_AGENT_DIR / "scheduler_mcp_server.py").resolve())
+            server_params = StdioServerParameters(
+                command="python3",
+                args=[server_script],
+                env=dict(os.environ),
+            )
+            async with stdio_client(server_params) as (read_stream, write_stream):
+                async with ClientSession(read_stream, write_stream) as session:
+                    await session.initialize()
+                    tool_result = await session.call_tool(tool_name, arguments)
+            for item in getattr(tool_result, "content", []):
+                text = getattr(item, "text", "")
+                if isinstance(text, str) and text.strip():
+                    try:
+                        parsed = json.loads(text)
+                        if isinstance(parsed, dict):
+                            return parsed
+                    except json.JSONDecodeError:
+                        return {"status": "ok", "raw": text}
+            return {"status": "error", "error": "Пустой ответ scheduler MCP инструмента."}
+
+        try:
+            return asyncio.run(_call())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(_call())
+            finally:
+                loop.close()
+        except Exception as e:
+            return {"status": "error", "error": f"MCP scheduler вызов не выполнен: {e}"}
+
+    def scheduler_upsert_task_via_mcp(
+        self,
+        name: str,
+        kind: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        delay_seconds: int = 0,
+        interval_seconds: int = 0,
+        active: bool = True,
+        max_runs: int = 0,
+    ) -> dict[str, Any]:
+        return self._call_scheduler_tool_via_mcp(
+            "schedule_upsert_task",
+            {
+                "name": name,
+                "kind": kind,
+                "payload": payload or {},
+                "delay_seconds": int(delay_seconds),
+                "interval_seconds": int(interval_seconds),
+                "active": bool(active),
+                "max_runs": int(max_runs),
+            },
+        )
+
+    def scheduler_list_tasks_via_mcp(self, *, include_inactive: bool = False) -> dict[str, Any]:
+        return self._call_scheduler_tool_via_mcp(
+            "schedule_list_tasks",
+            {"include_inactive": include_inactive},
+        )
+
+    def scheduler_run_due_via_mcp(self, *, limit: int = 20) -> dict[str, Any]:
+        return self._call_scheduler_tool_via_mcp("schedule_run_due", {"limit": int(limit)})
+
+    def scheduler_summary_via_mcp(self, *, hours: int = 24) -> dict[str, Any]:
+        return self._call_scheduler_tool_via_mcp(
+            "schedule_get_summary",
+            {"hours": int(hours)},
+        )
+
+    def scheduler_human_summary_via_mcp(self, *, hours: int = 24) -> dict[str, Any]:
+        return self._call_scheduler_tool_via_mcp(
+            "schedule_get_human_summary",
+            {"hours": int(hours)},
+        )
+
     def _sync_short_term_memory(self, *, decay_notes: bool = True) -> None:
         """Краткосрочная память: синхронизируется с текущим диалогом."""
         dialog = flatten_messages_for_export(self._state)

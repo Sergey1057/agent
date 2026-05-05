@@ -7,6 +7,8 @@
 from __future__ import annotations
 
 import argparse
+import json
+import time
 
 from agent import LLMAgent, RunResult, clear_history_file
 from context_strategies import ContextStrategyKind
@@ -94,6 +96,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /task ... — состояние задачи как FSM (этап/шаг/ожидаемое действие, pause/resume + явные переходы)\n"
             "  /invariants — инварианты проекта (архитектура, стек, бизнес-правила; отдельно от диалога)\n"
             "  /github <owner>/<repo> [вопрос] — вызвать MCP GitHub tool; при вопросе ответить с учётом результата\n"
+            "  /schedule ... — MCP-планировщик: reminder, периодический сбор и summary\n"
             "  /help — эта справка"
         )
 
@@ -408,6 +411,101 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
         result = agent.run(enriched)
         return result.text
 
+    if cmd == "/schedule":
+        if not arg:
+            return (
+                "Формат:\n"
+                "  /schedule list\n"
+                "  /schedule run [limit]\n"
+                "  /schedule summary [hours]\n"
+                "  /schedule report [hours]\n"
+                "  /schedule add reminder <name> <delay_sec> <message>\n"
+                "  /schedule add collector <name> <interval_sec> <source>\n"
+                "  /schedule add summary <name> <interval_sec> <message>"
+            )
+        tw = arg.split(maxsplit=1)
+        sub = tw[0].strip().lower()
+        rest = tw[1].strip() if len(tw) > 1 else ""
+        if sub == "list":
+            payload = agent.scheduler_list_tasks_via_mcp(include_inactive=True)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if sub == "run":
+            limit = 20
+            if rest:
+                try:
+                    limit = max(1, int(rest))
+                except ValueError:
+                    return "run: limit должен быть числом."
+            payload = agent.scheduler_run_due_via_mcp(limit=limit)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if sub == "summary":
+            hours = 24
+            if rest:
+                try:
+                    hours = max(1, int(rest))
+                except ValueError:
+                    return "summary: hours должен быть числом."
+            payload = agent.scheduler_summary_via_mcp(hours=hours)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if sub in ("report", "human-summary", "human_summary"):
+            hours = 24
+            if rest:
+                try:
+                    hours = max(1, int(rest))
+                except ValueError:
+                    return "report: hours должен быть числом."
+            payload = agent.scheduler_human_summary_via_mcp(hours=hours)
+            if payload.get("status") != "ok":
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+            text = str(payload.get("summary_text") or "").strip()
+            if text:
+                return text
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if sub == "add":
+            parts = rest.split(maxsplit=4)
+            if len(parts) < 4:
+                return (
+                    "Формат:\n"
+                    "  /schedule add reminder <name> <delay_sec> <message>\n"
+                    "  /schedule add collector <name> <interval_sec> <source>\n"
+                    "  /schedule add summary <name> <interval_sec> <message>"
+                )
+            kind_alias = parts[0].strip().lower()
+            name = parts[1].strip()
+            try:
+                seconds = max(0, int(parts[2]))
+            except ValueError:
+                return "Параметр delay/interval должен быть числом секунд."
+            text = parts[3] if len(parts) == 4 else parts[3] + " " + parts[4]
+            if kind_alias in ("reminder", "remind"):
+                payload = agent.scheduler_upsert_task_via_mcp(
+                    name=name,
+                    kind="reminder",
+                    delay_seconds=seconds,
+                    payload={"message": text},
+                )
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+            if kind_alias in ("collector", "collect", "data_collection"):
+                payload = agent.scheduler_upsert_task_via_mcp(
+                    name=name,
+                    kind="data_collection",
+                    delay_seconds=0,
+                    interval_seconds=seconds,
+                    payload={"source": text},
+                )
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+            if kind_alias == "summary":
+                payload = agent.scheduler_upsert_task_via_mcp(
+                    name=name,
+                    kind="summary",
+                    delay_seconds=0,
+                    interval_seconds=seconds,
+                    payload={"message": text},
+                )
+                return json.dumps(payload, ensure_ascii=False, indent=2)
+            return "Неизвестный тип: используйте reminder | collector | summary."
+        return "Неизвестная подкоманда /schedule."
+
     # Не наша команда — пусть уйдёт в модель (например /path/to/file)
     return None
 
@@ -443,6 +541,23 @@ def main() -> None:
         default="",
         help="Если задано с --github-repo: вопрос к агенту с использованием MCP результата",
     )
+    p.add_argument(
+        "--schedule-daemon",
+        action="store_true",
+        help="Запустить 24/7 цикл scheduler MCP: run_due + периодический summary",
+    )
+    p.add_argument(
+        "--schedule-interval-sec",
+        type=int,
+        default=30,
+        help="Интервал проверки due-задач в daemon-режиме",
+    )
+    p.add_argument(
+        "--schedule-summary-every-sec",
+        type=int,
+        default=300,
+        help="Как часто печатать агрегированную сводку в daemon-режиме",
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
@@ -467,6 +582,37 @@ def main() -> None:
 
     if args.query is not None:
         _print_run_result(agent.run(args.query))
+        return
+
+    if args.schedule_daemon:
+        poll_sec = max(1, int(args.schedule_interval_sec))
+        summary_sec = max(1, int(args.schedule_summary_every_sec))
+        next_summary_at = time.time()
+        print(
+            "Scheduler daemon запущен (Ctrl+C для остановки).\n"
+            f"Интервал run_due: {poll_sec} сек; summary: каждые {summary_sec} сек.\n"
+        )
+        try:
+            while True:
+                run_payload = agent.scheduler_run_due_via_mcp(limit=50)
+                executed_count = int(run_payload.get("executed_count", 0) or 0)
+                if executed_count > 0:
+                    print(f"[scheduler] Выполнено задач: {executed_count}")
+                    print(json.dumps(run_payload, ensure_ascii=False, indent=2))
+                now_ts = time.time()
+                if now_ts >= next_summary_at:
+                    summary_payload = agent.scheduler_summary_via_mcp(hours=24)
+                    text_payload = agent.scheduler_human_summary_via_mcp(hours=24)
+                    text = str(text_payload.get("summary_text") or "").strip()
+                    print("[scheduler] Summary (24h):")
+                    if text:
+                        print(text)
+                    else:
+                        print(json.dumps(summary_payload, ensure_ascii=False, indent=2))
+                    next_summary_at = now_ts + summary_sec
+                time.sleep(poll_sec)
+        except KeyboardInterrupt:
+            print("\nScheduler daemon остановлен.")
         return
 
     print(
