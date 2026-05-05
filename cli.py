@@ -93,6 +93,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /status — состояние ветвления\n"
             "  /task ... — состояние задачи как FSM (этап/шаг/ожидаемое действие, pause/resume + явные переходы)\n"
             "  /invariants — инварианты проекта (архитектура, стек, бизнес-правила; отдельно от диалога)\n"
+            "  /github <owner>/<repo> [вопрос] — вызвать MCP GitHub tool; при вопросе ответить с учётом результата\n"
             "  /help — эта справка"
         )
 
@@ -382,6 +383,31 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /invariants clear <раздел|all>"
         )
 
+    if cmd == "/github":
+        if not arg:
+            return (
+                "Формат: /github <owner>/<repo> [вопрос]\n"
+                "Пример: /github python/cpython какие ключевые метрики?"
+            )
+        parts = arg.split(maxsplit=1)
+        repo_ref = parts[0].strip()
+        question = parts[1].strip() if len(parts) > 1 else ""
+        if "/" not in repo_ref:
+            return "Ожидается owner/repo, например: python/cpython"
+        owner, repo = repo_ref.split("/", 1)
+        payload = agent.fetch_github_repo_via_mcp(owner, repo, include_readme=False)
+        if payload.get("status") != "ok":
+            return f"MCP error: {payload.get('error', 'unknown')}"
+        if not question:
+            return f"MCP result:\n{payload}"
+        enriched = (
+            "Используй данные из MCP GitHub инструмента при ответе.\n"
+            f"Данные: {payload}\n"
+            f"Вопрос пользователя: {question}"
+        )
+        result = agent.run(enriched)
+        return result.text
+
     # Не наша команда — пусть уйдёт в модель (например /path/to/file)
     return None
 
@@ -407,12 +433,37 @@ def main() -> None:
             "или sliding_window)"
         ),
     )
+    p.add_argument(
+        "--github-repo",
+        default="",
+        help="Вызвать MCP GitHub tool для owner/repo (пример: python/cpython)",
+    )
+    p.add_argument(
+        "--github-ask",
+        default="",
+        help="Если задано с --github-repo: вопрос к агенту с использованием MCP результата",
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
 
     strat = _strategy_from_arg(args.context_strategy)
     agent = LLMAgent(context_strategy=strat)
+
+    if args.github_repo:
+        if "/" not in args.github_repo:
+            raise SystemExit("--github-repo должен быть в формате owner/repo")
+        owner, repo = args.github_repo.split("/", 1)
+        payload = agent.fetch_github_repo_via_mcp(owner, repo, include_readme=False)
+        print(f"MCP result: {payload}")
+        if args.github_ask.strip():
+            enriched = (
+                "Используй данные из MCP GitHub инструмента при ответе.\n"
+                f"Данные: {payload}\n"
+                f"Вопрос пользователя: {args.github_ask.strip()}"
+            )
+            _print_run_result(agent.run(enriched))
+        return
 
     if args.query is not None:
         _print_run_result(agent.run(args.query))
