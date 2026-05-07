@@ -97,6 +97,8 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /invariants — инварианты проекта (архитектура, стек, бизнес-правила; отдельно от диалога)\n"
             "  /github <owner>/<repo> [вопрос] — вызвать MCP GitHub tool; при вопросе ответить с учётом результата\n"
             "  /schedule ... — MCP-планировщик: reminder, периодический сбор и summary\n"
+            "  /mcp flow <owner>/<repo> <query> [| file_path] — длинный orchestration flow через несколько MCP-серверов\n"
+            "  /mcp auto <текст запроса> — авто-выбор MCP-инструмента и сервера по policy\n"
             "  /pipeline <query> [| file_path] — MCP-цепочка search -> summorize -> saveToFile\n"
             "  /help — эта справка"
         )
@@ -551,6 +553,48 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
         )
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    if cmd == "/mcp":
+        if not arg:
+            return (
+                "Формат:\n"
+                "  /mcp flow <owner>/<repo> <query> [| file_path]\n"
+                "  /mcp auto <текст запроса>\n"
+                "Пример: /mcp flow python/cpython mcp orchestration тест | memory/pipeline_from_cli.txt"
+            )
+        tw = arg.split(maxsplit=2)
+        if tw[0].strip().lower() == "auto":
+            request = tw[1].strip() if len(tw) > 1 else ""
+            if len(tw) > 2:
+                request = request + " " + tw[2].strip()
+            if not request.strip():
+                return "Формат: /mcp auto <текст запроса>"
+            payload = agent.route_mcp_request(request.strip())
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if len(tw) < 3 or tw[0].strip().lower() != "flow":
+            return (
+                "Поддерживается: /mcp flow ... и /mcp auto ..."
+            )
+        repo_ref = tw[1].strip()
+        query_part = tw[2].strip()
+        if "/" not in repo_ref:
+            return "Ожидается owner/repo, например: python/cpython"
+        owner, repo = repo_ref.split("/", 1)
+        query = query_part
+        file_path = ""
+        if "|" in query_part:
+            left, right = query_part.split("|", 1)
+            query = left.strip()
+            file_path = right.strip()
+        if not query:
+            return "Нужен query: /mcp flow <owner>/<repo> <query> [| file_path]"
+        payload = agent.run_multi_server_mcp_flow(
+            owner=owner,
+            repo=repo,
+            query=query,
+            file_path=file_path,
+        )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
+
     # Не наша команда — пусть уйдёт в модель (например /path/to/file)
     return None
 
@@ -603,6 +647,26 @@ def main() -> None:
         default=300,
         help="Как часто печатать агрегированную сводку в daemon-режиме",
     )
+    p.add_argument(
+        "--mcp-flow-repo",
+        default="",
+        help="Запустить длинный MCP flow для owner/repo (пример: python/cpython)",
+    )
+    p.add_argument(
+        "--mcp-flow-query",
+        default="",
+        help="Запрос для длинного MCP flow",
+    )
+    p.add_argument(
+        "--mcp-flow-file-path",
+        default="memory/pipeline_from_cli.txt",
+        help="Файл для saveToFile внутри MCP flow",
+    )
+    p.add_argument(
+        "--mcp-auto",
+        default="",
+        help="Запустить policy-роутер MCP по текстовому запросу",
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
@@ -627,6 +691,26 @@ def main() -> None:
 
     if args.query is not None:
         _print_run_result(agent.run(args.query))
+        return
+
+    if args.mcp_flow_repo:
+        if "/" not in args.mcp_flow_repo:
+            raise SystemExit("--mcp-flow-repo должен быть в формате owner/repo")
+        if not args.mcp_flow_query.strip():
+            raise SystemExit("--mcp-flow-query обязателен вместе с --mcp-flow-repo")
+        owner, repo = args.mcp_flow_repo.split("/", 1)
+        payload = agent.run_multi_server_mcp_flow(
+            owner=owner,
+            repo=repo,
+            query=args.mcp_flow_query.strip(),
+            file_path=args.mcp_flow_file_path.strip(),
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return
+
+    if args.mcp_auto.strip():
+        payload = agent.route_mcp_request(args.mcp_auto.strip())
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
         return
 
     if args.schedule_daemon:

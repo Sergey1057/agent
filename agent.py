@@ -48,6 +48,22 @@ except ImportError:
     load_dotenv = None  # type: ignore[misc, assignment]
 
 _AGENT_DIR = Path(__file__).resolve().parent
+_MCP_SERVER_SCRIPTS: dict[str, Path] = {
+    "github": (_AGENT_DIR / "github_mcp_server.py").resolve(),
+    "scheduler": (_AGENT_DIR / "scheduler_mcp_server.py").resolve(),
+}
+_MCP_TOOL_ROUTES: dict[str, str] = {
+    "github_get_repo": "github",
+    "search": "scheduler",
+    "summorize": "scheduler",
+    "saveToFile": "scheduler",
+    "run_tools_pipeline": "scheduler",
+    "schedule_upsert_task": "scheduler",
+    "schedule_list_tasks": "scheduler",
+    "schedule_run_due": "scheduler",
+    "schedule_get_summary": "scheduler",
+    "schedule_get_human_summary": "scheduler",
+}
 
 DEFAULT_HISTORY_FILENAME = "chat_history.json"
 DEFAULT_HISTORY_MAX_MESSAGES = 200
@@ -964,59 +980,42 @@ class LLMAgent:
         """
         Вызывает локальный MCP-сервер GitHub и возвращает результат инструмента.
         """
-
-        async def _call() -> dict[str, Any]:
-            from mcp import ClientSession, StdioServerParameters
-            from mcp.client.stdio import stdio_client
-
-            server_script = str((_AGENT_DIR / "github_mcp_server.py").resolve())
-            server_params = StdioServerParameters(
-                command="python3",
-                args=[server_script],
-                env=dict(os.environ),
-            )
-            async with stdio_client(server_params) as (read_stream, write_stream):
-                async with ClientSession(read_stream, write_stream) as session:
-                    await session.initialize()
-                    tool_result = await session.call_tool(
-                        "github_get_repo",
-                        {
-                            "owner": owner,
-                            "repo": repo,
-                            "include_readme": include_readme,
-                        },
-                    )
-            for item in getattr(tool_result, "content", []):
-                text = getattr(item, "text", "")
-                if isinstance(text, str) and text.strip():
-                    try:
-                        parsed = json.loads(text)
-                        if isinstance(parsed, dict):
-                            return parsed
-                    except json.JSONDecodeError:
-                        return {"status": "ok", "raw": text}
-            return {"status": "error", "error": "Пустой ответ инструмента MCP."}
-
-        try:
-            return asyncio.run(_call())
-        except RuntimeError:
-            # Защита для среды с уже запущенным event loop.
-            loop = asyncio.new_event_loop()
-            try:
-                return loop.run_until_complete(_call())
-            finally:
-                loop.close()
-        except Exception as e:
-            return {"status": "error", "error": f"MCP вызов не выполнен: {e}"}
+        return self._call_mcp_tool(
+            "github_get_repo",
+            {
+                "owner": owner,
+                "repo": repo,
+                "include_readme": include_readme,
+            },
+        )
 
     def _call_scheduler_tool_via_mcp(
         self, tool_name: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
+        return self._call_mcp_tool(tool_name, arguments, server_name="scheduler")
+
+    def _call_mcp_tool(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        server_name: str = "",
+    ) -> dict[str, Any]:
+        route = (server_name or "").strip().lower() or _MCP_TOOL_ROUTES.get(tool_name, "")
+        if route not in _MCP_SERVER_SCRIPTS:
+            return {
+                "status": "error",
+                "error": (
+                    f"Не найден MCP-сервер для инструмента '{tool_name}'. "
+                    f"Известные серверы: {', '.join(sorted(_MCP_SERVER_SCRIPTS.keys()))}"
+                ),
+            }
+
         async def _call() -> dict[str, Any]:
             from mcp import ClientSession, StdioServerParameters
             from mcp.client.stdio import stdio_client
 
-            server_script = str((_AGENT_DIR / "scheduler_mcp_server.py").resolve())
+            server_script = str(_MCP_SERVER_SCRIPTS[route])
             server_params = StdioServerParameters(
                 command="python3",
                 args=[server_script],
@@ -1035,7 +1034,10 @@ class LLMAgent:
                             return parsed
                     except json.JSONDecodeError:
                         return {"status": "ok", "raw": text}
-            return {"status": "error", "error": "Пустой ответ scheduler MCP инструмента."}
+            return {
+                "status": "error",
+                "error": f"Пустой ответ MCP инструмента '{tool_name}' от сервера '{route}'.",
+            }
 
         try:
             return asyncio.run(_call())
@@ -1046,7 +1048,241 @@ class LLMAgent:
             finally:
                 loop.close()
         except Exception as e:
-            return {"status": "error", "error": f"MCP scheduler вызов не выполнен: {e}"}
+            return {
+                "status": "error",
+                "error": (
+                    f"MCP вызов не выполнен: tool={tool_name}, server={route}, error={e}"
+                ),
+            }
+
+    def run_multi_server_mcp_flow(
+        self,
+        *,
+        owner: str,
+        repo: str,
+        query: str,
+        file_path: str = "",
+    ) -> dict[str, Any]:
+        """
+        Длинный orchestration-flow через несколько MCP-серверов:
+        1) github_get_repo (github server)
+        2) run_tools_pipeline (scheduler server)
+        3) schedule_upsert_task reminder (scheduler server)
+        4) schedule_list_tasks (scheduler server)
+        """
+        steps: list[dict[str, Any]] = []
+        call_order = 0
+
+        def _step(tool: str, args: dict[str, Any]) -> dict[str, Any]:
+            nonlocal call_order
+            call_order += 1
+            route = _MCP_TOOL_ROUTES.get(tool, "unknown")
+            result = self._call_mcp_tool(tool, args)
+            row = {
+                "order": call_order,
+                "tool": tool,
+                "server": route,
+                "status": result.get("status"),
+                "ok": result.get("status") == "ok",
+                "result": result,
+            }
+            steps.append(row)
+            return result
+
+        github_data = _step(
+            "github_get_repo",
+            {"owner": owner, "repo": repo, "include_readme": False},
+        )
+        if github_data.get("status") != "ok":
+            return {"status": "error", "failed_step": "github_get_repo", "steps": steps}
+
+        repo_name = str(github_data.get("full_name") or f"{owner}/{repo}")
+        stars = int(github_data.get("stargazers_count") or 0)
+        pipeline_query = f"{query}. repo={repo_name}; stars={stars}"
+        pipeline_data = _step(
+            "run_tools_pipeline",
+            {"query": pipeline_query, "file_path": file_path, "limit": 5},
+        )
+        if pipeline_data.get("status") != "ok":
+            return {"status": "error", "failed_step": "run_tools_pipeline", "steps": steps}
+
+        reminder_message = f"Проверить pipeline для {repo_name}"
+        upsert_data = _step(
+            "schedule_upsert_task",
+            {
+                "name": f"mcp-flow-{owner}-{repo}",
+                "kind": "reminder",
+                "payload": {"message": reminder_message},
+                "delay_seconds": 1,
+                "interval_seconds": 0,
+                "active": True,
+                "max_runs": 1,
+            },
+        )
+        if upsert_data.get("status") != "ok":
+            return {"status": "error", "failed_step": "schedule_upsert_task", "steps": steps}
+
+        list_data = _step("schedule_list_tasks", {"include_inactive": True})
+        if list_data.get("status") != "ok":
+            return {"status": "error", "failed_step": "schedule_list_tasks", "steps": steps}
+
+        expected_tools = [
+            "github_get_repo",
+            "run_tools_pipeline",
+            "schedule_upsert_task",
+            "schedule_list_tasks",
+        ]
+        expected_servers = ["github", "scheduler", "scheduler", "scheduler"]
+        actual_tools = [str(x.get("tool") or "") for x in steps]
+        actual_servers = [str(x.get("server") or "") for x in steps]
+        order_ok = actual_tools == expected_tools
+        routes_ok = actual_servers == expected_servers
+
+        return {
+            "status": "ok",
+            "flow": "multi_server_orchestration",
+            "steps": steps,
+            "verification": {
+                "order_ok": order_ok,
+                "routes_ok": routes_ok,
+                "expected_tools": expected_tools,
+                "actual_tools": actual_tools,
+                "expected_servers": expected_servers,
+                "actual_servers": actual_servers,
+            },
+        }
+
+    @staticmethod
+    def _extract_repo_ref(text: str) -> tuple[str, str] | None:
+        m = re.search(r"\b([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)\b", text or "")
+        if not m:
+            return None
+        return m.group(1), m.group(2)
+
+    def route_mcp_request(self, request: str) -> dict[str, Any]:
+        """
+        Policy-роутер MCP:
+        - GitHub metadata: github_get_repo
+        - Pipeline: run_tools_pipeline
+        - Schedule: schedule_* инструменты
+        - Смешанный сценарий: multi-server flow
+        """
+        text = (request or "").strip()
+        if not text:
+            return {"status": "error", "error": "Пустой запрос для MCP-роутера."}
+
+        low = text.lower()
+        repo_ref = self._extract_repo_ref(text)
+        has_repo = repo_ref is not None
+        has_schedule = any(
+            token in low
+            for token in (
+                "schedule",
+                "распис",
+                "напомин",
+                "reminder",
+                "summary",
+                "сводк",
+                "collector",
+            )
+        )
+        has_pipeline = any(
+            token in low
+            for token in ("pipeline", "пайп", "search", "summorize", "save")
+        )
+        has_github = any(
+            token in low for token in ("github", "repo", "repository", "репозитор")
+        )
+        wants_run_due = any(token in low for token in ("run due", "run_due", "выполни due"))
+        wants_list = any(token in low for token in (" list", "список", "show tasks"))
+        wants_summary = any(token in low for token in ("summary", "сводк", "report"))
+
+        if has_repo and has_pipeline:
+            owner, repo = repo_ref or ("", "")
+            result = self.run_multi_server_mcp_flow(
+                owner=owner,
+                repo=repo,
+                query=text,
+                file_path="memory/pipeline_from_cli.txt",
+            )
+            return {
+                "status": result.get("status", "error"),
+                "selected_route": "multi_server_flow",
+                "selected_server": "github+scheduler",
+                "selected_tool": "github_get_repo + run_tools_pipeline + schedule_*",
+                "result": result,
+            }
+
+        if has_repo and (has_github or not has_schedule):
+            owner, repo = repo_ref or ("", "")
+            result = self._call_mcp_tool(
+                "github_get_repo",
+                {"owner": owner, "repo": repo, "include_readme": False},
+            )
+            return {
+                "status": result.get("status", "error"),
+                "selected_route": "github_repo_metadata",
+                "selected_server": "github",
+                "selected_tool": "github_get_repo",
+                "result": result,
+            }
+
+        if has_schedule and wants_run_due:
+            result = self._call_mcp_tool("schedule_run_due", {"limit": 20})
+            return {
+                "status": result.get("status", "error"),
+                "selected_route": "scheduler_run_due",
+                "selected_server": "scheduler",
+                "selected_tool": "schedule_run_due",
+                "result": result,
+            }
+
+        if has_schedule and wants_list:
+            result = self._call_mcp_tool("schedule_list_tasks", {"include_inactive": True})
+            return {
+                "status": result.get("status", "error"),
+                "selected_route": "scheduler_list",
+                "selected_server": "scheduler",
+                "selected_tool": "schedule_list_tasks",
+                "result": result,
+            }
+
+        if has_schedule and wants_summary:
+            result = self._call_mcp_tool("schedule_get_human_summary", {"hours": 24})
+            return {
+                "status": result.get("status", "error"),
+                "selected_route": "scheduler_summary",
+                "selected_server": "scheduler",
+                "selected_tool": "schedule_get_human_summary",
+                "result": result,
+            }
+
+        if has_pipeline:
+            result = self._call_mcp_tool(
+                "run_tools_pipeline",
+                {
+                    "query": text,
+                    "file_path": "memory/pipeline_from_cli.txt",
+                    "limit": 5,
+                },
+            )
+            return {
+                "status": result.get("status", "error"),
+                "selected_route": "pipeline",
+                "selected_server": "scheduler",
+                "selected_tool": "run_tools_pipeline",
+                "result": result,
+            }
+
+        result = self._call_mcp_tool("schedule_get_summary", {"hours": 24})
+        return {
+            "status": result.get("status", "error"),
+            "selected_route": "fallback_summary",
+            "selected_server": "scheduler",
+            "selected_tool": "schedule_get_summary",
+            "result": result,
+            "note": "Запрос не распознан явно; применён fallback summary.",
+        }
 
     def scheduler_upsert_task_via_mcp(
         self,
