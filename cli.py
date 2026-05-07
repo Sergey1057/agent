@@ -97,6 +97,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /invariants — инварианты проекта (архитектура, стек, бизнес-правила; отдельно от диалога)\n"
             "  /github <owner>/<repo> [вопрос] — вызвать MCP GitHub tool; при вопросе ответить с учётом результата\n"
             "  /schedule ... — MCP-планировщик: reminder, периодический сбор и summary\n"
+            "  /pipeline <query> [| file_path] — MCP-цепочка search -> summorize -> saveToFile\n"
             "  /help — эта справка"
         )
 
@@ -419,6 +420,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 "  /schedule run [limit]\n"
                 "  /schedule summary [hours]\n"
                 "  /schedule report [hours]\n"
+                "  /schedule pipeline <query> [| file_path]\n"
                 "  /schedule add reminder <name> <delay_sec> <message>\n"
                 "  /schedule add collector <name> <interval_sec> <source>\n"
                 "  /schedule add summary <name> <interval_sec> <message>"
@@ -460,6 +462,27 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             text = str(payload.get("summary_text") or "").strip()
             if text:
                 return text
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if sub == "pipeline":
+            if not rest:
+                return (
+                    "Формат: /schedule pipeline <query> [| file_path]\n"
+                    "Пример: /schedule pipeline MCP pipeline данные | memory/pipeline_result.txt"
+                )
+            query = rest
+            file_path = ""
+            if "|" in rest:
+                left, right = rest.split("|", 1)
+                query = left.strip()
+                file_path = right.strip()
+            query = query.strip()
+            if not query:
+                return "pipeline: нужен query."
+            payload = agent.scheduler_run_tools_pipeline_via_mcp(
+                query=query,
+                file_path=file_path,
+                limit=5,
+            )
             return json.dumps(payload, ensure_ascii=False, indent=2)
         if sub == "add":
             parts = rest.split(maxsplit=4)
@@ -505,6 +528,28 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 return json.dumps(payload, ensure_ascii=False, indent=2)
             return "Неизвестный тип: используйте reminder | collector | summary."
         return "Неизвестная подкоманда /schedule."
+
+    if cmd == "/pipeline":
+        if not arg:
+            return (
+                "Формат: /pipeline <query> [| file_path]\n"
+                "Пример: /pipeline MCP pipeline данные | memory/pipeline_result.txt"
+            )
+        query = arg
+        file_path = ""
+        if "|" in arg:
+            left, right = arg.split("|", 1)
+            query = left.strip()
+            file_path = right.strip()
+        query = query.strip()
+        if not query:
+            return "Нужен query: /pipeline <query> [| file_path]"
+        payload = agent.scheduler_run_tools_pipeline_via_mcp(
+            query=query,
+            file_path=file_path,
+            limit=5,
+        )
+        return json.dumps(payload, ensure_ascii=False, indent=2)
 
     # Не наша команда — пусть уйдёт в модель (например /path/to/file)
     return None

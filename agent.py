@@ -1093,6 +1093,18 @@ class LLMAgent:
             {"hours": int(hours)},
         )
 
+    def scheduler_run_tools_pipeline_via_mcp(
+        self, *, query: str, file_path: str = "", limit: int = 5
+    ) -> dict[str, Any]:
+        return self._call_scheduler_tool_via_mcp(
+            "run_tools_pipeline",
+            {
+                "query": str(query or "").strip(),
+                "file_path": str(file_path or "").strip(),
+                "limit": int(limit),
+            },
+        )
+
     def _sync_short_term_memory(self, *, decay_notes: bool = True) -> None:
         """Краткосрочная память: синхронизируется с текущим диалогом."""
         dialog = flatten_messages_for_export(self._state)
