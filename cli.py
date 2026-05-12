@@ -100,6 +100,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /mcp flow <owner>/<repo> <query> [| file_path] — длинный orchestration flow через несколько MCP-серверов\n"
             "  /mcp auto <текст запроса> — авто-выбор MCP-инструмента и сервера по policy\n"
             "  /pipeline <query> [| file_path] — MCP-цепочка search -> summorize -> saveToFile\n"
+            "  /rag [on|off|top N] [путь_к_index.json] — RAG: выдержки из индекса в запрос к LLM\n"
             "  /help — эта справка"
         )
 
@@ -553,6 +554,38 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
         )
         return json.dumps(payload, ensure_ascii=False, indent=2)
 
+    if cmd == "/rag":
+        parts = arg.split()
+        if not parts:
+            return (
+                f"{agent.rag_status_line()}\n\n"
+                "Формат:\n"
+                "  /rag on [путь/index.json] — включить (путь опционален, если уже задан)\n"
+                "  /rag off — выключить\n"
+                "  /rag top <N> — число чанков (N ≥ 1)\n"
+                "Переменные окружения: LLM_AGENT_RAG, LLM_AGENT_RAG_INDEX, LLM_AGENT_RAG_TOP_K"
+            )
+        sub = parts[0].lower()
+        if sub == "off":
+            agent.set_rag(False)
+            return agent.rag_status_line()
+        if sub == "on":
+            path_arg = parts[1] if len(parts) > 1 else None
+            if path_arg:
+                agent.set_rag(True, index_path=path_arg)
+            else:
+                agent.set_rag(True)
+            return agent.rag_status_line()
+        if sub == "top":
+            if len(parts) < 2:
+                return "Формат: /rag top <N>"
+            try:
+                agent.set_rag_top_k(int(parts[1]))
+            except ValueError:
+                return "N должно быть целым числом."
+            return agent.rag_status_line()
+        return "Неизвестная подкоманда /rag. См. /rag без аргументов."
+
     if cmd == "/mcp":
         if not arg:
             return (
@@ -667,12 +700,44 @@ def main() -> None:
         default="",
         help="Запустить policy-роутер MCP по текстовому запросу",
     )
+    p.add_argument(
+        "--rag",
+        action="store_true",
+        help="Включить RAG: к запросу подмешиваются релевантные чанки из JSON-индекса",
+    )
+    p.add_argument(
+        "--no-rag",
+        action="store_true",
+        help="Выключить RAG даже при LLM_AGENT_RAG=1",
+    )
+    p.add_argument(
+        "--rag-index",
+        default="",
+        help="Путь к index_*.json (иначе LLM_AGENT_RAG_INDEX)",
+    )
+    p.add_argument(
+        "--rag-top-k",
+        type=int,
+        default=None,
+        help="Сколько чанков подмешивать (иначе LLM_AGENT_RAG_TOP_K или 5)",
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
 
     strat = _strategy_from_arg(args.context_strategy)
-    agent = LLMAgent(context_strategy=strat)
+    rag_kw: bool | None = None
+    if args.no_rag:
+        rag_kw = False
+    elif args.rag:
+        rag_kw = True
+    rag_index_kw = args.rag_index.strip() or None
+    agent = LLMAgent(
+        context_strategy=strat,
+        rag_enabled=rag_kw,
+        rag_index_path=rag_index_kw,
+        rag_top_k=args.rag_top_k,
+    )
 
     if args.github_repo:
         if "/" not in args.github_repo:
@@ -747,6 +812,7 @@ def main() -> None:
     print(
         "Пустая строка — выход. Ctrl+D — выход.\n"
         f"{agent.branching_status_line()}\n"
+        f"{agent.rag_status_line()}\n"
         "Команды: /help\n"
     )
     while True:

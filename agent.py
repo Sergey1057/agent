@@ -41,6 +41,7 @@ from context_strategies import (
     trim_messages,
     update_facts_with_llm,
 )
+from document_index.rag import augment_user_message_with_rag
 
 try:
     from dotenv import load_dotenv
@@ -670,6 +671,18 @@ class TaskStateMachine:
         return [{"role": "system", "content": content}]
 
 
+def _replace_last_user_message_content(
+    messages: list[dict[str, str]], new_content: str
+) -> list[dict[str, str]]:
+    """Копия списка сообщений с заменой текста последней реплики role=user (для RAG)."""
+    out: list[dict[str, str]] = [dict(m) for m in messages]
+    for i in range(len(out) - 1, -1, -1):
+        if str(out[i].get("role")) == "user":
+            out[i] = {"role": "user", "content": new_content}
+            break
+    return out
+
+
 def _merge_leading_system_messages(
     messages: list[dict[str, str]],
 ) -> list[dict[str, str]]:
@@ -705,6 +718,8 @@ class LLMAgent:
     хранятся вне диалога и подмешиваются в системный контекст; агент обязан их соблюдать.
     working/long_term попадают в запрос как системные блоки; записи в них делаются явно
     через save_memory_entry (CLI: /memory put ...).
+    Режим RAG (run(..., rag=True) или set_rag): эмбеддинг вопроса, top-k чанков из JSON-индекса,
+    объединение с вопросом в одно пользовательское сообщение к API; в истории хранится исходный вопрос.
     """
 
     def __init__(
@@ -712,6 +727,9 @@ class LLMAgent:
         config: AgentConfig | None = None,
         *,
         context_strategy: ContextStrategyKind | str | None = None,
+        rag_enabled: bool | None = None,
+        rag_index_path: Path | str | None = None,
+        rag_top_k: int | None = None,
     ) -> None:
         self._config = config or AgentConfig.from_env()
         self._resolved_model: str | None = self._config.model
@@ -732,6 +750,30 @@ class LLMAgent:
         self._user_profile = UserProfileStore()
         self._task_state = TaskStateMachine(
             self._memory._dir / TASK_STATE_FILENAME
+        )
+        if rag_enabled is None:
+            self._rag_enabled = (os.environ.get("LLM_AGENT_RAG") or "").strip().lower() in (
+                "1",
+                "true",
+                "yes",
+                "on",
+            )
+        else:
+            self._rag_enabled = bool(rag_enabled)
+        rp = ""
+        if rag_index_path is not None:
+            rp = str(Path(rag_index_path).expanduser()).strip()
+        else:
+            rp = (os.environ.get("LLM_AGENT_RAG_INDEX") or "").strip()
+        self._rag_index_path = (
+            Path(rp).expanduser().resolve() if rp else None
+        )
+        tk_env = (os.environ.get("LLM_AGENT_RAG_TOP_K") or "").strip()
+        self._rag_top_k = max(
+            1,
+            int(rag_top_k)
+            if rag_top_k is not None
+            else (int(tk_env) if tk_env.isdigit() else 5),
         )
         self._sync_short_term_memory(decay_notes=False)
 
@@ -774,6 +816,26 @@ class LLMAgent:
             f"Стратегия: branching | prefix: {len(self._state.branch_prefix)} | "
             f"ветки: {bids} | активная: {self._state.active_branch}"
         )
+
+    @property
+    def rag_enabled(self) -> bool:
+        return self._rag_enabled
+
+    def set_rag(self, enabled: bool, *, index_path: Path | str | None = None) -> None:
+        self._rag_enabled = bool(enabled)
+        if index_path is not None:
+            p = str(Path(index_path).expanduser()).strip()
+            self._rag_index_path = Path(p).resolve() if p else None
+
+    def set_rag_top_k(self, k: int) -> None:
+        self._rag_top_k = max(1, int(k))
+
+    def rag_status_line(self) -> str:
+        if not self._rag_enabled:
+            return "RAG: выкл"
+        p = self._rag_index_path
+        ps = str(p) if p else "(путь не задан)"
+        return f"RAG: вкл | top_k={self._rag_top_k} | индекс: {ps}"
 
     def merge_fact(self, key: str, value: str) -> tuple[bool, str]:
         """Ручное добавление или обновление пары ключ–значение в facts (только sticky_facts)."""
@@ -1512,9 +1574,11 @@ class LLMAgent:
             return None
         return _parse_tokens_count_response(data)
 
-    def run(self, user_message: str) -> RunResult:
+    def run(self, user_message: str, *, rag: bool | None = None) -> RunResult:
         """
         Основной вход агента: один пользовательский запрос → текст ответа модели и статистика токенов.
+        rag=None — использовать режим агента (set_rag / LLM_AGENT_RAG); True/False — принудительно
+        с RAG или без для этого вызова.
         """
         text = (user_message or "").strip()
         if not text:
@@ -1616,8 +1680,37 @@ class LLMAgent:
 
         self._trim_branching_linear()
 
-        user_turn_tokens = self._tokens_count(access_token, model, [text])
+        use_rag = self._rag_enabled if rag is None else bool(rag)
+        api_user_content: str | None = None
+        if use_rag:
+            idx = self._rag_index_path
+            if idx is None:
+                self._rollback_last_user()
+                self._state.facts = facts_backup
+                return RunResult(
+                    text=(
+                        "RAG включён, но путь к индексу не задан. Задайте LLM_AGENT_RAG_INDEX, "
+                        "аргумент rag_index_path при создании агента, --rag-index в CLI или /rag on <путь>."
+                    )
+                )
+            try:
+                api_user_content, _hits = augment_user_message_with_rag(
+                    text,
+                    idx,
+                    top_k=self._rag_top_k,
+                )
+            except (OSError, ValueError, RuntimeError, json.JSONDecodeError, TypeError) as e:
+                self._rollback_last_user()
+                self._state.facts = facts_backup
+                return RunResult(text=f"Ошибка RAG: {e}")
+
+        turn_for_token_count = api_user_content if api_user_content is not None else text
+        user_turn_tokens = self._tokens_count(access_token, model, [turn_for_token_count])
         api_messages = self._build_messages_for_api()
+        if api_user_content is not None:
+            api_messages = _replace_last_user_message_content(
+                api_messages, api_user_content
+            )
         dialog_input_tokens = self._tokens_count(
             access_token, model, [m["content"] for m in api_messages]
         )
