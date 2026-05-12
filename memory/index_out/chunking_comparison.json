@@ -1,0 +1,30 @@
+{
+  "document": "/Users/sergei/Documents/YesBro/llm_agent/memory/note.txt",
+  "parameters": {
+    "fixed_size": {
+      "chunk_size": 1500,
+      "overlap": 200
+    },
+    "structure": {
+      "max_section_chars": 4000,
+      "section_sub_overlap": 200
+    }
+  },
+  "fixed_size": {
+    "chunk_count": 94,
+    "total_chars": 140931,
+    "avg_chars": 1499.27,
+    "max_chars": 1500,
+    "min_chars": 1454,
+    "sections_nonempty": 0
+  },
+  "structure": {
+    "chunk_count": 46,
+    "total_chars": 125344,
+    "avg_chars": 2724.87,
+    "max_chars": 4000,
+    "min_chars": 222,
+    "sections_nonempty": 46
+  },
+  "comparison_notes": "fixed_size: равномерные окна по символам; границы могут резать смысловые абзацы. structure: чанки привязаны к заголовкам разделов; длинные разделы режутся с тем же полем section в метаданных."
+}
