@@ -41,7 +41,7 @@ from context_strategies import (
     trim_messages,
     update_facts_with_llm,
 )
-from document_index.rag import augment_user_message_with_rag
+from document_index.rag import RagRetrievalConfig, augment_user_message_with_rag
 
 try:
     from dotenv import load_dotenv
@@ -730,6 +730,7 @@ class LLMAgent:
         rag_enabled: bool | None = None,
         rag_index_path: Path | str | None = None,
         rag_top_k: int | None = None,
+        rag_retrieval_config: RagRetrievalConfig | None = None,
     ) -> None:
         self._config = config or AgentConfig.from_env()
         self._resolved_model: str | None = self._config.model
@@ -775,6 +776,7 @@ class LLMAgent:
             if rag_top_k is not None
             else (int(tk_env) if tk_env.isdigit() else 5),
         )
+        self._rag_retrieval_config = rag_retrieval_config
         self._sync_short_term_memory(decay_notes=False)
 
     @staticmethod
@@ -835,7 +837,17 @@ class LLMAgent:
             return "RAG: выкл"
         p = self._rag_index_path
         ps = str(p) if p else "(путь не задан)"
-        return f"RAG: вкл | top_k={self._rag_top_k} | индекс: {ps}"
+        if self._rag_retrieval_config is not None:
+            c = self._rag_retrieval_config
+            return (
+                f"RAG: вкл | явный конфиг | final_k={c.final_top_k} | retrieve_k={c.retrieve_k} | "
+                f"min_sim={c.min_similarity} | hybrid={c.hybrid_rerank} | rewrite={c.query_rewrite} | индекс: {ps}"
+            )
+        c = RagRetrievalConfig.from_env(self._rag_top_k)
+        return (
+            f"RAG: вкл | final_k={c.final_top_k} | retrieve_k={c.retrieve_k} | "
+            f"min_sim={c.min_similarity} | hybrid={c.hybrid_rerank} | rewrite={c.query_rewrite} | индекс: {ps}"
+        )
 
     def merge_fact(self, key: str, value: str) -> tuple[bool, str]:
         """Ручное добавление или обновление пары ключ–значение в facts (только sticky_facts)."""
@@ -1698,6 +1710,7 @@ class LLMAgent:
                     text,
                     idx,
                     top_k=self._rag_top_k,
+                    config=self._rag_retrieval_config,
                 )
             except (OSError, ValueError, RuntimeError, json.JSONDecodeError, TypeError) as e:
                 self._rollback_last_user()

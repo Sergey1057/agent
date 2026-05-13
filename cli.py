@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import time
 
 from agent import LLMAgent, RunResult, clear_history_file
@@ -562,8 +563,15 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 "Формат:\n"
                 "  /rag on [путь/index.json] — включить (путь опционален, если уже задан)\n"
                 "  /rag off — выключить\n"
-                "  /rag top <N> — число чанков (N ≥ 1)\n"
-                "Переменные окружения: LLM_AGENT_RAG, LLM_AGENT_RAG_INDEX, LLM_AGENT_RAG_TOP_K"
+                "  /rag top <N> — число чанков после фильтрации (N ≥ 1)\n"
+                "Переменные окружения:\n"
+                "  LLM_AGENT_RAG, LLM_AGENT_RAG_INDEX, LLM_AGENT_RAG_TOP_K (final top-k)\n"
+                "  LLM_AGENT_RAG_RETRIEVE_K — кандидатов на первом этапе\n"
+                "  LLM_AGENT_RAG_MIN_SIM — порог косинуса/гибрида (none — без порога)\n"
+                "  LLM_AGENT_RAG_QUERY_REWRITE=0 — отключить лёгкий rewrite запроса\n"
+                "  LLM_AGENT_RAG_HYBRID=0 — без лексического реранка поверх косинуса\n"
+                "  LLM_AGENT_RAG_LEGACY=1 — старый одноэтапный RAG\n"
+                "Сравнение режимов: python -m document_index.rag_compare --index <index.json>"
             )
         sub = parts[0].lower()
         if sub == "off":
@@ -719,11 +727,34 @@ def main() -> None:
         "--rag-top-k",
         type=int,
         default=None,
-        help="Сколько чанков подмешивать (иначе LLM_AGENT_RAG_TOP_K или 5)",
+        help="Сколько чанков подмешивать после фильтрации (иначе LLM_AGENT_RAG_TOP_K или 5)",
+    )
+    p.add_argument(
+        "--rag-legacy",
+        action="store_true",
+        help="Одноэтапный RAG без порога/гибрида/rewrite (LLM_AGENT_RAG_LEGACY=1)",
+    )
+    p.add_argument(
+        "--rag-retrieve-k",
+        type=int,
+        default=None,
+        help="Первый этап: сколько кандидатов (LLM_AGENT_RAG_RETRIEVE_K)",
+    )
+    p.add_argument(
+        "--rag-min-sim",
+        default=None,
+        help="Порог similarity / гибрида, либо none (LLM_AGENT_RAG_MIN_SIM)",
     )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
+
+    if args.rag_legacy:
+        os.environ["LLM_AGENT_RAG_LEGACY"] = "1"
+    if args.rag_retrieve_k is not None:
+        os.environ["LLM_AGENT_RAG_RETRIEVE_K"] = str(int(args.rag_retrieve_k))
+    if args.rag_min_sim is not None:
+        os.environ["LLM_AGENT_RAG_MIN_SIM"] = str(args.rag_min_sim).strip()
 
     strat = _strategy_from_arg(args.context_strategy)
     rag_kw: bool | None = None
