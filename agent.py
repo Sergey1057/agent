@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Literal
 
@@ -41,7 +41,12 @@ from context_strategies import (
     trim_messages,
     update_facts_with_llm,
 )
-from document_index.rag import RagRetrievalConfig, augment_user_message_with_rag
+from document_index.rag import (
+    RagRetrievalConfig,
+    augment_user_message_with_rag,
+    resolve_rag_index_path,
+    validate_rag_grounding_reply,
+)
 
 try:
     from dotenv import load_dotenv
@@ -454,6 +459,8 @@ class TokenStats:
 class RunResult:
     text: str
     stats: TokenStats | None = None
+    """Метаданные последнего RAG-хода (если RAG был включён для этого run)."""
+    rag: dict[str, Any] | None = None
 
 
 TaskStage = Literal["planning", "plan_approved", "execution", "validation", "done"]
@@ -827,7 +834,13 @@ class LLMAgent:
         self._rag_enabled = bool(enabled)
         if index_path is not None:
             p = str(Path(index_path).expanduser()).strip()
-            self._rag_index_path = Path(p).resolve() if p else None
+            if not p:
+                self._rag_index_path = None
+            else:
+                try:
+                    self._rag_index_path = resolve_rag_index_path(p)
+                except FileNotFoundError:
+                    self._rag_index_path = Path(p).resolve()
 
     def set_rag_top_k(self, k: int) -> None:
         self._rag_top_k = max(1, int(k))
@@ -1694,6 +1707,8 @@ class LLMAgent:
 
         use_rag = self._rag_enabled if rag is None else bool(rag)
         api_user_content: str | None = None
+        rag_bundle: dict[str, Any] | None = None
+        rag_aug_for_check = None
         if use_rag:
             idx = self._rag_index_path
             if idx is None:
@@ -1706,12 +1721,28 @@ class LLMAgent:
                     )
                 )
             try:
-                api_user_content, _hits = augment_user_message_with_rag(
+                rag_aug = augment_user_message_with_rag(
                     text,
                     idx,
                     top_k=self._rag_top_k,
                     config=self._rag_retrieval_config,
                 )
+                api_user_content = rag_aug.prompt
+                _cids: list[str] = []
+                for _h in rag_aug.hits:
+                    _md = _h.get("metadata")
+                    _cids.append(
+                        str(_md.get("chunk_id") or "")
+                        if isinstance(_md, dict)
+                        else ""
+                    )
+                rag_aug_for_check = rag_aug
+                rag_bundle = {
+                    "context_sufficient": rag_aug.context_sufficient,
+                    "weak_reason": rag_aug.weak_reason,
+                    "best_retrieval_score": rag_aug.best_score,
+                    "chunk_ids": _cids,
+                }
             except (OSError, ValueError, RuntimeError, json.JSONDecodeError, TypeError) as e:
                 self._rollback_last_user()
                 self._state.facts = facts_backup
@@ -1780,4 +1811,12 @@ class LLMAgent:
 
         self._trim_branching_after_split()
         self._persist_history()
-        return RunResult(text=reply, stats=stats)
+        rag_out: dict[str, Any] | None = None
+        if rag_bundle is not None and rag_aug_for_check is not None:
+            chk = validate_rag_grounding_reply(
+                reply,
+                rag_aug_for_check.hits,
+                context_sufficient=rag_aug_for_check.context_sufficient,
+            )
+            rag_out = {**rag_bundle, "grounding": asdict(chk)}
+        return RunResult(text=reply, stats=stats, rag=rag_out)

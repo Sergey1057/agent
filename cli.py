@@ -40,6 +40,17 @@ def _print_run_result(result: RunResult) -> None:
         line = result.stats.format_line()
         if line:
             print(line)
+    if result.rag:
+        r = result.rag
+        g = r.get("grounding") or {}
+        suf = r.get("context_sufficient")
+        print(
+            "[RAG] "
+            f"контекст_достаточен={suf} | "
+            f"разделы: ответ={g.get('has_answer_section')} "
+            f"источники={g.get('has_sources_section')} цитаты={g.get('has_quotes_section')} | "
+            f"цитаты_дословно_в_чанках={g.get('quotes_verbatim_in_chunks')}"
+        )
 
 
 def _strategy_from_arg(raw: str | None) -> ContextStrategyKind | None:
@@ -562,6 +573,8 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 f"{agent.rag_status_line()}\n\n"
                 "Формат:\n"
                 "  /rag on [путь/index.json] — включить (путь опционален, если уже задан)\n"
+                "    Путь без ведущего `/` — относительно текущей директории (иначе `/…` = корень диска).\n"
+                "    Пример: memory/index_out/index_structure.json\n"
                 "  /rag off — выключить\n"
                 "  /rag top <N> — число чанков после фильтрации (N ≥ 1)\n"
                 "Переменные окружения:\n"
@@ -571,6 +584,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
                 "  LLM_AGENT_RAG_QUERY_REWRITE=0 — отключить лёгкий rewrite запроса\n"
                 "  LLM_AGENT_RAG_HYBRID=0 — без лексического реранка поверх косинуса\n"
                 "  LLM_AGENT_RAG_LEGACY=1 — старый одноэтапный RAG\n"
+                "  LLM_AGENT_RAG_ALLOW_WEAK_CONTEXT=1 — при слабом retrieval всё равно подставлять чанки (без режима «не знаю»)\n"
                 "Сравнение режимов: python -m document_index.rag_compare --index <index.json>"
             )
         sub = parts[0].lower()
@@ -745,6 +759,11 @@ def main() -> None:
         default=None,
         help="Порог similarity / гибрида, либо none (LLM_AGENT_RAG_MIN_SIM)",
     )
+    p.add_argument(
+        "--rag-allow-weak-context",
+        action="store_true",
+        help="При слабом retrieval всё равно подставлять чанки (LLM_AGENT_RAG_ALLOW_WEAK_CONTEXT=1)",
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
@@ -755,6 +774,8 @@ def main() -> None:
         os.environ["LLM_AGENT_RAG_RETRIEVE_K"] = str(int(args.rag_retrieve_k))
     if args.rag_min_sim is not None:
         os.environ["LLM_AGENT_RAG_MIN_SIM"] = str(args.rag_min_sim).strip()
+    if args.rag_allow_weak_context:
+        os.environ["LLM_AGENT_RAG_ALLOW_WEAK_CONTEXT"] = "1"
 
     strat = _strategy_from_arg(args.context_strategy)
     rag_kw: bool | None = None
