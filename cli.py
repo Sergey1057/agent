@@ -764,6 +764,21 @@ def main() -> None:
         action="store_true",
         help="При слабом retrieval всё равно подставлять чанки (LLM_AGENT_RAG_ALLOW_WEAK_CONTEXT=1)",
     )
+    p.add_argument(
+        "--rag-mini-chat",
+        action="store_true",
+        help="Мини-чат: отдельная история, RAG на каждый вопрос, память задачи, всегда вывод источников",
+    )
+    p.add_argument(
+        "--rag-mini-history",
+        default="",
+        help="Файл истории для --rag-mini-chat (по умолчанию memory/rag_mini_chat_history.json в проекте)",
+    )
+    p.add_argument(
+        "--rag-mini-task-memory",
+        default="",
+        help="Файл памяти задачи для --rag-mini-chat (по умолчанию memory/rag_mini_task_memory.json)",
+    )
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
@@ -776,6 +791,17 @@ def main() -> None:
         os.environ["LLM_AGENT_RAG_MIN_SIM"] = str(args.rag_min_sim).strip()
     if args.rag_allow_weak_context:
         os.environ["LLM_AGENT_RAG_ALLOW_WEAK_CONTEXT"] = "1"
+
+    if args.rag_mini_chat:
+        from rag_mini_chat import run_rag_mini_chat_interactive
+
+        run_rag_mini_chat_interactive(
+            rag_index=args.rag_index.strip() or None,
+            rag_top_k=args.rag_top_k,
+            task_memory_path=args.rag_mini_task_memory.strip() or None,
+            history_path=args.rag_mini_history.strip() or None,
+        )
+        return
 
     strat = _strategy_from_arg(args.context_strategy)
     rag_kw: bool | None = None

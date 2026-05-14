@@ -44,6 +44,7 @@ from context_strategies import (
 from document_index.rag import (
     RagRetrievalConfig,
     augment_user_message_with_rag,
+    format_rag_hit_lines,
     resolve_rag_index_path,
     validate_rag_grounding_reply,
 )
@@ -461,6 +462,8 @@ class RunResult:
     stats: TokenStats | None = None
     """Метаданные последнего RAG-хода (если RAG был включён для этого run)."""
     rag: dict[str, Any] | None = None
+    """Строки retrieval (чанки), всегда печатаются мини-чатом рядом с ответом."""
+    rag_source_lines: list[str] | None = None
 
 
 TaskStage = Literal["planning", "plan_approved", "execution", "validation", "done"]
@@ -1812,6 +1815,7 @@ class LLMAgent:
         self._trim_branching_after_split()
         self._persist_history()
         rag_out: dict[str, Any] | None = None
+        rag_lines: list[str] | None = None
         if rag_bundle is not None and rag_aug_for_check is not None:
             chk = validate_rag_grounding_reply(
                 reply,
@@ -1819,4 +1823,5 @@ class LLMAgent:
                 context_sufficient=rag_aug_for_check.context_sufficient,
             )
             rag_out = {**rag_bundle, "grounding": asdict(chk)}
-        return RunResult(text=reply, stats=stats, rag=rag_out)
+            rag_lines = format_rag_hit_lines(rag_aug_for_check.hits)
+        return RunResult(text=reply, stats=stats, rag=rag_out, rag_source_lines=rag_lines)

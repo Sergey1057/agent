@@ -547,6 +547,25 @@ def _chunk_source_label(meta: dict[str, Any]) -> str:
         return raw
 
 
+def format_rag_hit_lines(hits: list[dict[str, Any]]) -> list[str]:
+    """
+    Человекочитаемые строки для UI: источник, раздел, chunk_id, вид score.
+    Используется CLI мини-чата и RunResult.rag_source_lines.
+    """
+    out: list[str] = []
+    for h in hits:
+        meta = _hit_meta_dict(h)
+        section = str(meta.get("section") or "").strip() or "(раздел не указан)"
+        cid = str(meta.get("chunk_id") or "").strip() or "(chunk_id не указан)"
+        src = _chunk_source_label(meta)
+        score = float(h.get("score") or 0.0)
+        kind = str(h.get("score_kind") or "")
+        out.append(
+            f"- {src} | раздел: {section} | chunk_id: {cid} | {kind or 'score'}: {score:.4g}"
+        )
+    return out
+
+
 def _norm_ws_substring(needle: str, haystack: str) -> bool:
     n = " ".join((needle or "").split())
     if len(n) < 8:
