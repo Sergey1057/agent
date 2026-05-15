@@ -82,6 +82,21 @@ GIGACHAT_API_V1_BASE = "https://gigachat.devices.sberbank.ru/api/v1"
 DEFAULT_GIGACHAT_MODEL = "GigaChat"
 DEFAULT_GIGACHAT_SCOPE = "GIGACHAT_API_PERS"
 
+# LM Studio / OpenAI-compatible локальный сервер (lms server start)
+DEFAULT_LOCAL_API_BASE = "http://127.0.0.1:1234/v1"
+DEFAULT_LOCAL_API_KEY = "lm-studio"
+
+BackendKind = Literal["cloud", "local"]
+
+
+def _normalize_backend(raw: str) -> BackendKind:
+    s = (raw or "cloud").strip().lower()
+    if s in ("local", "lmstudio", "lm_studio", "lm-studio"):
+        return "local"
+    if s in ("cloud", "gigachat", "giga", "sber"):
+        return "cloud"
+    raise ValueError(f"Неизвестный backend: {raw!r} (ожидается cloud или local)")
+
 # Дефолтный User-Agent для HTTP-клиента
 _DEFAULT_UA = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
@@ -353,8 +368,9 @@ def _get_gigachat_access_token(
 
 @dataclass
 class AgentConfig:
-    """Настройки GigaChat API."""
+    """Настройки API: cloud — GigaChat; local — LM Studio (OpenAI-compatible)."""
 
+    backend: BackendKind = "cloud"
     oauth_url: str = GIGACHAT_OAUTH_URL
     api_base: str = GIGACHAT_API_V1_BASE
     authorization_key: str | None = None
@@ -363,14 +379,49 @@ class AgentConfig:
     timeout_sec: float = 120.0
 
     @classmethod
-    def from_env(cls) -> AgentConfig:
+    def from_env(
+        cls,
+        *,
+        backend: str | None = None,
+        local_model: str | None = None,
+        local_url: str | None = None,
+    ) -> AgentConfig:
         _load_project_dotenv()
+        bk = _normalize_backend(
+            backend or os.environ.get("LLM_AGENT_BACKEND") or "cloud"
+        )
+        if bk == "local":
+            base = (
+                (local_url or "").strip()
+                or (os.environ.get("LLM_AGENT_LOCAL_BASE_URL") or "").strip()
+                or (os.environ.get("LM_STUDIO_BASE_URL") or "").strip()
+                or DEFAULT_LOCAL_API_BASE
+            ).rstrip("/")
+            model_raw = (
+                (local_model or "").strip()
+                or (os.environ.get("LLM_AGENT_LOCAL_MODEL") or "").strip()
+                or (os.environ.get("LM_STUDIO_MODEL") or "").strip()
+            )
+            api_key = (
+                (os.environ.get("LLM_AGENT_LOCAL_API_KEY") or "").strip()
+                or (os.environ.get("LM_API_TOKEN") or "").strip()
+                or DEFAULT_LOCAL_API_KEY
+            )
+            return cls(
+                backend="local",
+                oauth_url=GIGACHAT_OAUTH_URL,
+                api_base=base,
+                authorization_key=api_key,
+                scope=DEFAULT_GIGACHAT_SCOPE,
+                model=model_raw or None,
+            )
         key = (os.environ.get("GIGACHAT_API_KEY") or "").strip()
         model = (os.environ.get("GIGACHAT_MODEL") or DEFAULT_GIGACHAT_MODEL).strip()
         scope = (os.environ.get("GIGACHAT_SCOPE") or DEFAULT_GIGACHAT_SCOPE).strip()
         oauth = (os.environ.get("GIGACHAT_OAUTH_URL") or GIGACHAT_OAUTH_URL).strip()
         base = (os.environ.get("GIGACHAT_API_BASE") or GIGACHAT_API_V1_BASE).rstrip("/")
         return cls(
+            backend="cloud",
             oauth_url=oauth,
             api_base=base,
             authorization_key=key or None,
@@ -736,13 +787,22 @@ class LLMAgent:
         self,
         config: AgentConfig | None = None,
         *,
+        backend: str | None = None,
+        local_model: str | None = None,
+        local_url: str | None = None,
         context_strategy: ContextStrategyKind | str | None = None,
         rag_enabled: bool | None = None,
         rag_index_path: Path | str | None = None,
         rag_top_k: int | None = None,
         rag_retrieval_config: RagRetrievalConfig | None = None,
     ) -> None:
-        self._config = config or AgentConfig.from_env()
+        if config is None:
+            config = AgentConfig.from_env(
+                backend=backend,
+                local_model=local_model,
+                local_url=local_url,
+            )
+        self._config = config
         self._resolved_model: str | None = self._config.model
         self._history_path = _history_path_resolved()
         self._history_max_messages = _history_max_from_env()
@@ -847,6 +907,79 @@ class LLMAgent:
 
     def set_rag_top_k(self, k: int) -> None:
         self._rag_top_k = max(1, int(k))
+
+    @property
+    def backend(self) -> BackendKind:
+        return self._config.backend
+
+    def set_backend(
+        self,
+        backend: str,
+        *,
+        local_model: str | None = None,
+        local_url: str | None = None,
+    ) -> None:
+        """Переключить cloud (GigaChat) / local (LM Studio) в текущей сессии."""
+        bk = _normalize_backend(backend)
+        if bk == "local":
+            keep_model = (
+                (local_model or "").strip()
+                or (
+                    self._config.model
+                    if self._config.backend == "local"
+                    else ""
+                )
+            )
+            keep_url = (
+                (local_url or "").strip()
+                or (
+                    self._config.api_base
+                    if self._config.backend == "local"
+                    else ""
+                )
+            )
+            self._config = AgentConfig.from_env(
+                backend="local",
+                local_model=keep_model or None,
+                local_url=keep_url or None,
+            )
+        else:
+            self._config = AgentConfig.from_env(backend="cloud")
+        self._resolved_model = self._config.model
+        self._clear_dialog_on_backend_switch()
+
+    def _clear_dialog_on_backend_switch(self) -> None:
+        """Сброс диалога при смене backend — иначе FSM/отказы из прошлой сессии ломают local."""
+        self._state.messages = []
+        self._state.facts = {}
+        self._state.branching_split = False
+        self._state.branch_prefix = []
+        self._state.branches = {}
+        self._state.active_branch = "branch_a"
+        self._persist_history()
+
+    def _local_backend_system_messages(self) -> list[dict[str, str]]:
+        model_s = self._resolved_model or self._config.model or "local"
+        return [
+            {
+                "role": "system",
+                "content": (
+                    f"Ты локальная языковая модель «{model_s}», запущенная через LM Studio на этом компьютере. "
+                    "Это не GigaChat и не облачный ChatGPT. "
+                    "Отвечай по существу на вопросы пользователя на том языке, на котором он пишет. "
+                    "Не отказывайся от обычных информационных вопросов."
+                ),
+            }
+        ]
+
+    def backend_status_line(self) -> str:
+        if self._config.backend == "local":
+            model_s = self._resolved_model or self._config.model or "(авто из /v1/models)"
+            return (
+                f"Backend: local (LM Studio) | {self._config.api_base} | модель: {model_s}"
+            )
+        model_s = self._config.model or DEFAULT_GIGACHAT_MODEL
+        return f"Backend: cloud (GigaChat) | модель: {model_s}"
 
     def rag_status_line(self) -> str:
         if not self._rag_enabled:
@@ -1483,7 +1616,11 @@ class LLMAgent:
 
     def _build_messages_for_api(self) -> list[dict[str, str]]:
         out: list[dict[str, str]] = []
-        out.extend(self._task_state.build_system_message())
+        if self._config.backend == "local":
+            # FSM задачи требует отказов вне этапа planning — ломает обычный чат у local-моделей.
+            out.extend(self._local_backend_system_messages())
+        else:
+            out.extend(self._task_state.build_system_message())
         out.extend(self._invariants.build_system_messages())
         out.extend(self._user_profile.build_system_messages())
         out.extend(self._memory.build_memory_system_messages())
@@ -1532,6 +1669,12 @@ class LLMAgent:
         elif content is not None:
             reply = str(content).strip()
         else:
+            reply = ""
+        if not reply:
+            reasoning = msg.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                reply = reasoning.strip()
+        if not reply:
             reply = raw[:2000].strip()
         return reply, response_json
 
@@ -1567,6 +1710,11 @@ class LLMAgent:
             data: dict[str, Any] = json.loads(resp.read().decode())
         models = data.get("data") or []
         if not models:
+            if self._config.backend == "local":
+                raise RuntimeError(
+                    "Список моделей пуст. Запустите LM Studio Server (lms server start) "
+                    "и укажите LLM_AGENT_LOCAL_MODEL или --local-model."
+                )
             raise RuntimeError(
                 "Список моделей пуст. Укажите GIGACHAT_MODEL в окружении."
             )
@@ -1602,16 +1750,12 @@ class LLMAgent:
             return None
         return _parse_tokens_count_response(data)
 
-    def run(self, user_message: str, *, rag: bool | None = None) -> RunResult:
-        """
-        Основной вход агента: один пользовательский запрос → текст ответа модели и статистика токенов.
-        rag=None — использовать режим агента (set_rag / LLM_AGENT_RAG); True/False — принудительно
-        с RAG или без для этого вызова.
-        """
-        text = (user_message or "").strip()
-        if not text:
-            return RunResult(text="")
-
+    def _resolve_access_token(self) -> tuple[str | None, RunResult | None]:
+        if self._config.backend == "local":
+            return (
+                self._effective_authorization_key() or DEFAULT_LOCAL_API_KEY,
+                None,
+            )
         auth_key = self._effective_authorization_key()
         if not auth_key:
             primary = _AGENT_DIR / ".env"
@@ -1622,18 +1766,20 @@ class LLMAgent:
                     size_s = str(primary.stat().st_size)
                 except OSError:
                     pass
-            return RunResult(
-                text=(
-                    "Добавьте GIGACHAT_API_KEY: файл .env рядом с agent.py "
-                    "или export GIGACHAT_API_KEY=...\n"
-                    f"  Ожидаемый путь: {primary} (есть на диске: {'да' if primary.is_file() else 'нет'})\n"
-                    f"  Размер файла: {size_s} байт\n"
-                    "  Ключ авторизации: личный кабинет Studio → проект GigaChat API → Настройки API → Получить ключ\n"
-                    "  Документация: https://developers.sber.ru/docs/ru/gigachat/quickstart/ind-using-api"
-                    f"{extra}"
-                )
+            return (
+                None,
+                RunResult(
+                    text=(
+                        "Добавьте GIGACHAT_API_KEY: файл .env рядом с agent.py "
+                        "или export GIGACHAT_API_KEY=...\n"
+                        f"  Ожидаемый путь: {primary} (есть на диске: {'да' if primary.is_file() else 'нет'})\n"
+                        f"  Размер файла: {size_s} байт\n"
+                        "  Ключ авторизации: личный кабинет Studio → проект GigaChat API → Настройки API → Получить ключ\n"
+                        "  Документация: https://developers.sber.ru/docs/ru/gigachat/quickstart/ind-using-api"
+                        f"{extra}"
+                    )
+                ),
             )
-
         try:
             access_token = _get_gigachat_access_token(
                 auth_key,
@@ -1643,12 +1789,28 @@ class LLMAgent:
             )
         except OSError as e:
             msg = f"Ошибка при получении токена OAuth: {e}"
-            return RunResult(text=msg + _ssl_troubleshooting_hint(e))
+            return None, RunResult(text=msg + _ssl_troubleshooting_hint(e))
         except urllib.error.HTTPError as e:
             err_body = e.read().decode("utf-8", errors="replace")
-            return RunResult(text=f"Ошибка OAuth HTTP {e.code}: {err_body[:2000]}")
+            return None, RunResult(text=f"Ошибка OAuth HTTP {e.code}: {err_body[:2000]}")
         except (json.JSONDecodeError, RuntimeError, KeyError, TypeError) as e:
-            return RunResult(text=f"Ошибка разбора ответа OAuth: {e}")
+            return None, RunResult(text=f"Ошибка разбора ответа OAuth: {e}")
+        return access_token, None
+
+    def run(self, user_message: str, *, rag: bool | None = None) -> RunResult:
+        """
+        Основной вход агента: один пользовательский запрос → текст ответа модели и статистика токенов.
+        rag=None — использовать режим агента (set_rag / LLM_AGENT_RAG); True/False — принудительно
+        с RAG или без для этого вызова.
+        """
+        text = (user_message or "").strip()
+        if not text:
+            return RunResult(text="")
+
+        access_token, auth_err = self._resolve_access_token()
+        if auth_err is not None:
+            return auth_err
+        assert access_token is not None
 
         try:
             model = self._ensure_model(access_token)

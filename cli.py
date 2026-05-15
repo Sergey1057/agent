@@ -113,7 +113,33 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /mcp auto <текст запроса> — авто-выбор MCP-инструмента и сервера по policy\n"
             "  /pipeline <query> [| file_path] — MCP-цепочка search -> summorize -> saveToFile\n"
             "  /rag [on|off|top N] [путь_к_index.json] — RAG: выдержки из индекса в запрос к LLM\n"
+            "  /backend [cloud|local [model_id]] — облако (GigaChat) или локально (LM Studio)\n"
             "  /help — эта справка"
+        )
+
+    if cmd == "/backend":
+        if not arg:
+            return (
+                f"{agent.backend_status_line()}\n"
+                "Переключение: /backend cloud | /backend local [model_id]\n"
+                "Переменные: LLM_AGENT_BACKEND, LLM_AGENT_LOCAL_MODEL, LLM_AGENT_LOCAL_BASE_URL"
+            )
+        parts = arg.split(maxsplit=2)
+        sub = parts[0].strip().lower()
+        if sub not in ("cloud", "local", "gigachat", "giga", "sber", "lmstudio", "lm-studio"):
+            return "Укажите cloud или local, например: /backend local openai/gpt-oss-20b"
+        model_id = parts[1].strip() if len(parts) > 1 and sub in (
+            "local",
+            "lmstudio",
+            "lm-studio",
+        ) else None
+        try:
+            agent.set_backend(sub, local_model=model_id)
+        except ValueError as e:
+            return str(e)
+        return (
+            f"Переключено. {agent.backend_status_line()}\n"
+            "История диалога сброшена (чтобы не тянуть отказы/контекст GigaChat)."
         )
 
     if cmd == "/strategy":
@@ -676,6 +702,25 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--backend",
+        choices=["cloud", "local"],
+        default=None,
+        help=(
+            "Источник LLM: cloud — GigaChat (по умолчанию); local — LM Studio "
+            "(http://127.0.0.1:1234/v1). Иначе LLM_AGENT_BACKEND"
+        ),
+    )
+    p.add_argument(
+        "--local-model",
+        default="",
+        help="ID локальной модели (иначе LLM_AGENT_LOCAL_MODEL или первая из /v1/models)",
+    )
+    p.add_argument(
+        "--local-url",
+        default="",
+        help="Базовый URL локального API (иначе LLM_AGENT_LOCAL_BASE_URL или :1234/v1)",
+    )
+    p.add_argument(
         "--github-repo",
         default="",
         help="Вызвать MCP GitHub tool для owner/repo (пример: python/cpython)",
@@ -812,6 +857,9 @@ def main() -> None:
     rag_index_kw = args.rag_index.strip() or None
     agent = LLMAgent(
         context_strategy=strat,
+        backend=args.backend,
+        local_model=args.local_model.strip() or None,
+        local_url=args.local_url.strip() or None,
         rag_enabled=rag_kw,
         rag_index_path=rag_index_kw,
         rag_top_k=args.rag_top_k,
@@ -889,9 +937,10 @@ def main() -> None:
 
     print(
         "Пустая строка — выход. Ctrl+D — выход.\n"
+        f"{agent.backend_status_line()}\n"
         f"{agent.branching_status_line()}\n"
         f"{agent.rag_status_line()}\n"
-        "Команды: /help\n"
+        "Команды: /help, /backend cloud|local\n"
     )
     while True:
         try:
