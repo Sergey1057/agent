@@ -12,7 +12,7 @@ from typing import Any
 
 from agent import LLMAgent, RunResult
 from context_strategies import ContextStrategyKind
-from document_index.rag import parse_rag_grounding_sections
+from document_index.rag import default_rag_index_path, parse_rag_grounding_sections, resolve_rag_index_path
 from task_memory import DialogTaskMemory, parse_task_memory_json_from_reply
 
 _AGENT_DIR = Path(__file__).resolve().parent
@@ -98,16 +98,24 @@ def run_rag_mini_chat_interactive(
     rag_top_k: int | None,
     task_memory_path: Path | str | None,
     history_path: Path | str | None,
+    backend: str | None = None,
+    local_model: str | None = None,
+    local_url: str | None = None,
 ) -> None:
     idx_raw = rag_index
     if idx_raw is None or str(idx_raw).strip() == "":
-        idx = _DEFAULT_INDEX
+        idx = default_rag_index_path() or _DEFAULT_INDEX
     else:
-        idx = Path(str(idx_raw).strip()).expanduser()
+        try:
+            idx = resolve_rag_index_path(idx_raw)
+        except FileNotFoundError:
+            idx = Path(str(idx_raw).strip()).expanduser()
     if not idx.is_file():
         print(f"Индекс RAG не найден: {idx}")
         print("Укажите --rag-index или положите индекс в memory/index_out/index_structure.json")
         return
+
+    os.environ.setdefault("LLM_AGENT_RAG_LOCAL", "1")
 
     hist = _path_or_default(history_path, _default_history_path())
     task_p = _path_or_default(task_memory_path, _default_task_memory_path())
@@ -115,8 +123,12 @@ def run_rag_mini_chat_interactive(
     os.environ["LLM_AGENT_HISTORY_FILE"] = str(hist)
     os.environ.setdefault("LLM_AGENT_CONTEXT_STRATEGY", "sliding_window")
 
+    bk = (backend or os.environ.get("LLM_AGENT_BACKEND") or "local").strip()
     agent = RagMiniChatAgent(
         context_strategy=ContextStrategyKind.SLIDING_WINDOW,
+        backend=bk,
+        local_model=local_model,
+        local_url=local_url,
         rag_enabled=True,
         rag_index_path=idx,
         rag_top_k=rag_top_k,
@@ -125,9 +137,10 @@ def run_rag_mini_chat_interactive(
     agent.set_rag(True, index_path=idx)
 
     print(
-        "Мини-чат RAG + память задачи. Пустая строка — выход.\n"
+        "Мини-чат RAG + память задачи (retrieval локально, ответ — локальная LLM). Пустая строка — выход.\n"
         f"История: {hist}\n"
         f"Память задачи: {task_p}\n"
+        f"{agent.backend_status_line()}\n"
         f"{agent.rag_status_line()}\n"
         "Маркеры в сообщении пользователя:\n"
         "  ЦЕЛЬ: …  |  УТОЧНЕНИЕ: …  |  ТЕРМИН: ключ = значение\n"

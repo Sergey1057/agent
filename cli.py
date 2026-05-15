@@ -13,6 +13,7 @@ import time
 
 from agent import LLMAgent, RunResult, clear_history_file
 from context_strategies import ContextStrategyKind
+from document_index.rag import default_rag_index_path
 from user_profile import parse_profile_set_rest
 
 
@@ -114,6 +115,7 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /pipeline <query> [| file_path] — MCP-цепочка search -> summorize -> saveToFile\n"
             "  /rag [on|off|top N] [путь_к_index.json] — RAG: выдержки из индекса в запрос к LLM\n"
             "  /backend [cloud|local [model_id]] — облако (GigaChat) или локально (LM Studio)\n"
+            "  Запуск полностью локального RAG: python cli.py --local-rag\n"
             "  /help — эта справка"
         )
 
@@ -768,6 +770,14 @@ def main() -> None:
         help="Запустить policy-роутер MCP по текстовому запросу",
     )
     p.add_argument(
+        "--local-rag",
+        action="store_true",
+        help=(
+            "Полностью локальный RAG: backend=local (LM Studio), retrieval из memory/index_out, "
+            "без облачных эмбеддингов (LLM_AGENT_RAG_LOCAL=1)"
+        ),
+    )
+    p.add_argument(
         "--rag",
         action="store_true",
         help="Включить RAG: к запросу подмешиваются релевантные чанки из JSON-индекса",
@@ -828,6 +838,18 @@ def main() -> None:
     if args.reset_history:
         clear_history_file()
 
+    if args.local_rag:
+        os.environ.setdefault("LLM_AGENT_RAG", "1")
+        os.environ.setdefault("LLM_AGENT_RAG_LOCAL", "1")
+        if not args.rag_index.strip():
+            d = default_rag_index_path()
+            if d is not None:
+                args.rag_index = str(d)
+        if args.backend is None:
+            args.backend = "local"
+        if not args.rag:
+            args.rag = True
+
     if args.rag_legacy:
         os.environ["LLM_AGENT_RAG_LEGACY"] = "1"
     if args.rag_retrieve_k is not None:
@@ -845,6 +867,9 @@ def main() -> None:
             rag_top_k=args.rag_top_k,
             task_memory_path=args.rag_mini_task_memory.strip() or None,
             history_path=args.rag_mini_history.strip() or None,
+            backend=args.backend or ("local" if args.local_rag else None),
+            local_model=args.local_model.strip() or None,
+            local_url=args.local_url.strip() or None,
         )
         return
 
@@ -940,7 +965,12 @@ def main() -> None:
         f"{agent.backend_status_line()}\n"
         f"{agent.branching_status_line()}\n"
         f"{agent.rag_status_line()}\n"
-        "Команды: /help, /backend cloud|local\n"
+        "Команды: /help, /backend cloud|local, /rag on|off\n"
+        + (
+            "Режим: полностью локальный RAG (LM Studio + memory/index_out).\n"
+            if args.local_rag
+            else ""
+        )
     )
     while True:
         try:

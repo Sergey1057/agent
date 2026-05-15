@@ -8,9 +8,29 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from document_index.embeddings import embed_texts_auto
+from document_index.embeddings import (
+    embed_texts_deterministic,
+    embed_texts_local_batches,
+    embed_texts_openai,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_RAG_INDEX_REL = Path("memory/index_out/index_structure.json")
+
+
+def default_rag_index_path() -> Path | None:
+    """Индекс по умолчанию в репозитории (`memory/index_out/index_structure.json`), если файл есть."""
+    for base in (_REPO_ROOT, Path.cwd()):
+        cand = (base / DEFAULT_RAG_INDEX_REL).resolve()
+        if cand.is_file():
+            return cand
+    return None
+
+
+def _rag_local_only_env() -> bool:
+    """Retrieval без облачных эмбеддингов (даже при OPENAI_API_KEY в окружении)."""
+    v = (os.environ.get("LLM_AGENT_RAG_LOCAL") or "").strip().lower()
+    return v in ("1", "true", "yes", "on")
 
 
 def resolve_rag_index_path(raw: Path | str) -> Path:
@@ -78,6 +98,30 @@ def _cosine_sim(a: list[float], b: list[float]) -> float:
 def _dummy_from_index_meta(emb_meta: dict[str, Any]) -> bool:
     prov = str(emb_meta.get("provider") or "").lower()
     return prov == "deterministic_hash"
+
+
+def _embed_query_for_index(qtext: str, emb_meta: dict[str, Any]) -> list[float]:
+    """
+    Эмбеддинг запроса тем же провайдером, что и индекс (локально, без «утечки» в OpenAI).
+    """
+    if _dummy_from_index_meta(emb_meta):
+        vecs, _ = embed_texts_deterministic([qtext])
+        return [float(x) for x in vecs[0]]
+
+    prov = str(emb_meta.get("provider") or "").lower()
+    model = str(emb_meta.get("model") or "").strip() or None
+    local_only = _rag_local_only_env()
+
+    if prov == "sentence_transformers" or local_only:
+        vecs, _ = embed_texts_local_batches([qtext], model_name=model)
+        return [float(x) for x in vecs[0]]
+
+    if not local_only and prov == "openai_compatible" and os.environ.get("OPENAI_API_KEY", "").strip():
+        vecs, _ = embed_texts_openai([qtext], model=model)
+        return [float(x) for x in vecs[0]]
+
+    vecs, _ = embed_texts_local_batches([qtext], model_name=model)
+    return [float(x) for x in vecs[0]]
 
 
 def _lexical_match_terms(question: str) -> list[str]:
@@ -619,8 +663,7 @@ def retrieve_for_rag(
             weak_reason="" if ok else (reason or "lexical_weak"),
         )
 
-    vecs, _ = embed_texts_auto([qtext], dummy=False)
-    q = [float(x) for x in vecs[0]]
+    q = _embed_query_for_index(qtext, emb_meta)
     dim_q = len(q)
 
     first_emb: list[float] | None = None

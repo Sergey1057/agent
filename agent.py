@@ -44,6 +44,7 @@ from context_strategies import (
 from document_index.rag import (
     RagRetrievalConfig,
     augment_user_message_with_rag,
+    default_rag_index_path,
     format_rag_hit_lines,
     resolve_rag_index_path,
     validate_rag_grounding_reply,
@@ -836,9 +837,13 @@ class LLMAgent:
             rp = str(Path(rag_index_path).expanduser()).strip()
         else:
             rp = (os.environ.get("LLM_AGENT_RAG_INDEX") or "").strip()
-        self._rag_index_path = (
-            Path(rp).expanduser().resolve() if rp else None
-        )
+        if rp:
+            try:
+                self._rag_index_path = resolve_rag_index_path(rp)
+            except FileNotFoundError:
+                self._rag_index_path = Path(rp).expanduser().resolve()
+        else:
+            self._rag_index_path = default_rag_index_path()
         tk_env = (os.environ.get("LLM_AGENT_RAG_TOP_K") or "").strip()
         self._rag_top_k = max(
             1,
@@ -904,6 +909,8 @@ class LLMAgent:
                     self._rag_index_path = resolve_rag_index_path(p)
                 except FileNotFoundError:
                     self._rag_index_path = Path(p).resolve()
+        elif enabled and self._rag_index_path is None:
+            self._rag_index_path = default_rag_index_path()
 
     def set_rag_top_k(self, k: int) -> None:
         self._rag_top_k = max(1, int(k))
