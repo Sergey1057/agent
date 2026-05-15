@@ -35,8 +35,15 @@ def _read_recent_message_window() -> int:
         return 6
 
 
-# Значение читается при импорте модуля (как и раньше константа).
+# Значение по умолчанию при импорте (env); агент может задать своё окно в рантайме.
 RECENT_MESSAGE_WINDOW = _read_recent_message_window()
+
+
+def resolve_message_window(message_window: int | None) -> int:
+    """Окно реплик: явный аргумент агента или RECENT_MESSAGE_WINDOW из env."""
+    if message_window is None:
+        return RECENT_MESSAGE_WINDOW
+    return max(1, min(int(message_window), 500))
 
 FACTS_SYSTEM_PROMPT = (
     "Ты извлекаешь и обновляешь структурированные факты из диалога. "
@@ -253,7 +260,13 @@ def load_unified_state(path: Path) -> UnifiedChatState:
     return UnifiedChatState()
 
 
-def save_unified_state(path: Path, state: UnifiedChatState) -> None:
+def save_unified_state(
+    path: Path,
+    state: UnifiedChatState,
+    *,
+    message_window: int | None = None,
+) -> None:
+    win = resolve_message_window(message_window)
     path.parent.mkdir(parents=True, exist_ok=True)
     branching_obj: dict[str, Any] | None = None
     if state.strategy == ContextStrategyKind.BRANCHING and state.branching_split:
@@ -266,9 +279,9 @@ def save_unified_state(path: Path, state: UnifiedChatState) -> None:
 
     to_save = state.messages
     if state.strategy == ContextStrategyKind.SLIDING_WINDOW:
-        to_save = list(state.messages)[-RECENT_MESSAGE_WINDOW:]
+        to_save = list(state.messages)[-win:]
     elif state.strategy == ContextStrategyKind.STICKY_FACTS:
-        to_save = list(state.messages)[-RECENT_MESSAGE_WINDOW:]
+        to_save = list(state.messages)[-win:]
 
     facts_out: dict[str, str] = (
         dict(state.facts) if state.strategy == ContextStrategyKind.STICKY_FACTS else {}
@@ -290,13 +303,22 @@ def save_unified_state(path: Path, state: UnifiedChatState) -> None:
     tmp.replace(path)
 
 
-def build_sliding_api_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
-    return list(messages[-RECENT_MESSAGE_WINDOW:])
+def build_sliding_api_messages(
+    messages: list[dict[str, str]],
+    *,
+    message_window: int | None = None,
+) -> list[dict[str, str]]:
+    win = resolve_message_window(message_window)
+    return list(messages[-win:])
 
 
 def build_sticky_facts_api_messages(
-    facts: dict[str, str], messages: list[dict[str, str]]
+    facts: dict[str, str],
+    messages: list[dict[str, str]],
+    *,
+    message_window: int | None = None,
 ) -> list[dict[str, str]]:
+    win = resolve_message_window(message_window)
     out: list[dict[str, str]] = []
     if facts:
         lines = [f"- {k}: {v}" for k, v in sorted(facts.items()) if k]
@@ -305,7 +327,7 @@ def build_sticky_facts_api_messages(
             + "\n".join(lines)
         )
         out.append({"role": "system", "content": block})
-    out.extend(messages[-RECENT_MESSAGE_WINDOW:])
+    out.extend(messages[-win:])
     return out
 
 
@@ -357,13 +379,16 @@ def update_facts_with_llm(
     current_facts: dict[str, str],
     recent_messages: list[dict[str, str]],
     new_user_message: str,
+    *,
+    message_window: int | None = None,
 ) -> dict[str, str]:
+    win = resolve_message_window(message_window)
     """Вызывает LLM для обновления facts после сообщения пользователя."""
     payload = {
         "текущие_факты": current_facts,
         "последние_реплики": [
             {"role": m.get("role"), "content": m.get("content", "")}
-            for m in recent_messages[-RECENT_MESSAGE_WINDOW:]
+            for m in recent_messages[-win:]
         ],
         "новое_сообщение_пользователя": new_user_message,
     }

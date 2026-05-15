@@ -17,7 +17,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -26,6 +26,8 @@ import certifi
 from invariants import InvariantsStore
 from memory_store import AssistantMemoryStore
 from user_profile import UserProfileStore
+from generation_config import GenerationConfig
+from prompt_templates import PromptOverrides, render_local_system_message
 from context_strategies import (
     RECENT_MESSAGE_WINDOW,
     ContextStrategyKind,
@@ -796,6 +798,11 @@ class LLMAgent:
         rag_index_path: Path | str | None = None,
         rag_top_k: int | None = None,
         rag_retrieval_config: RagRetrievalConfig | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        context_window: int | None = None,
+        rag_prompt_file: str | Path | None = None,
+        local_prompt_file: str | Path | None = None,
     ) -> None:
         if config is None:
             config = AgentConfig.from_env(
@@ -852,7 +859,132 @@ class LLMAgent:
             else (int(tk_env) if tk_env.isdigit() else 5),
         )
         self._rag_retrieval_config = rag_retrieval_config
+        self._generation_defaults = GenerationConfig.from_env(
+            temperature=temperature,
+            max_tokens=max_tokens,
+            recent_message_window=context_window,
+        )
+        self._generation = replace(self._generation_defaults)
+        self._prompt_defaults = PromptOverrides.from_env(
+            rag_prompt_file=rag_prompt_file,
+            local_prompt_file=local_prompt_file,
+        )
+        self._prompt = replace(self._prompt_defaults)
         self._sync_short_term_memory(decay_notes=False)
+
+    @property
+    def prompt_overrides(self) -> PromptOverrides:
+        return self._prompt
+
+    def prompt_status_lines(self) -> list[str]:
+        return self._prompt.format_status_lines()
+
+    @staticmethod
+    def prompt_help_block() -> str:
+        return PromptOverrides().format_help_block()
+
+    def reset_prompt_templates(self) -> None:
+        self._prompt = replace(self._prompt_defaults)
+
+    def reset_rag_prompt_template(self) -> None:
+        self._prompt = replace(
+            self._prompt,
+            rag_template_text=self._prompt_defaults.rag_template_text,
+            rag_template_path=self._prompt_defaults.rag_template_path,
+        )
+
+    def reset_local_prompt_template(self) -> None:
+        self._prompt = replace(
+            self._prompt,
+            local_system_text=self._prompt_defaults.local_system_text,
+            local_system_path=self._prompt_defaults.local_system_path,
+        )
+
+    def set_rag_prompt_file(self, path: str | Path) -> None:
+        from prompt_templates import read_prompt_file, _resolve_path
+
+        p = _resolve_path(path)
+        text = read_prompt_file(path)
+        self._prompt = replace(
+            self._prompt, rag_template_text=text, rag_template_path=p
+        )
+
+    def set_local_prompt_file(self, path: str | Path) -> None:
+        from prompt_templates import read_prompt_file, _resolve_path
+
+        p = _resolve_path(path)
+        text = read_prompt_file(path)
+        self._prompt = replace(
+            self._prompt, local_system_text=text, local_system_path=p
+        )
+
+    def reload_local_prompt_template(self) -> None:
+        """Перечитать local system с диска (после правки memory/prompts/local_system.txt)."""
+        from prompt_templates import example_prompt_path, read_prompt_file
+
+        p = self._prompt.local_system_path or example_prompt_path("local")
+        text = read_prompt_file(p)
+        self._prompt = replace(
+            self._prompt, local_system_text=text, local_system_path=p
+        )
+
+    def _ensure_local_prompt_loaded(self) -> None:
+        if self._prompt.local_system_text is not None:
+            return
+        from prompt_templates import example_prompt_path, read_prompt_file
+
+        p = example_prompt_path("local")
+        if not p.is_file():
+            return
+        try:
+            text = read_prompt_file(p)
+            self._prompt = replace(
+                self._prompt, local_system_text=text, local_system_path=p
+            )
+        except (OSError, ValueError):
+            pass
+
+    @property
+    def generation_config(self) -> GenerationConfig:
+        return self._generation
+
+    def generation_status_line(self) -> str:
+        return self._generation.format_status_line()
+
+    @staticmethod
+    def generation_help_block() -> str:
+        return GenerationConfig().format_help_block()
+
+    def reset_generation_config(self) -> None:
+        self._generation = replace(self._generation_defaults)
+        self._trim_dialog_to_context_window()
+
+    def set_temperature(self, value: float | None) -> None:
+        if value is not None:
+            if value < 0.0 or value > 2.0:
+                raise ValueError("temperature должна быть в диапазоне 0.0–2.0")
+        self._generation = replace(self._generation, temperature=value)
+
+    def set_max_tokens(self, value: int | None) -> None:
+        if value is not None:
+            if value < 1 or value > 128_000:
+                raise ValueError("max_tokens должно быть от 1 до 128000")
+        self._generation = replace(self._generation, max_tokens=value)
+
+    def set_context_window(self, n: int) -> None:
+        v = int(n)
+        if v < 1 or v > 500:
+            raise ValueError("context window должно быть от 1 до 500")
+        self._generation = replace(self._generation, recent_message_window=v)
+        self._trim_dialog_to_context_window()
+
+    def _trim_dialog_to_context_window(self) -> None:
+        win = self._generation.recent_message_window
+        if self._state.strategy in (
+            ContextStrategyKind.SLIDING_WINDOW,
+            ContextStrategyKind.STICKY_FACTS,
+        ):
+            trim_messages(self._state.messages, win)
 
     @staticmethod
     def _coerce_strategy(val: ContextStrategyKind | str) -> ContextStrategyKind:
@@ -950,6 +1082,7 @@ class LLMAgent:
                 local_model=keep_model or None,
                 local_url=keep_url or None,
             )
+            self._ensure_local_prompt_loaded()
         else:
             self._config = AgentConfig.from_env(backend="cloud")
         self._resolved_model = self._config.model
@@ -967,17 +1100,10 @@ class LLMAgent:
 
     def _local_backend_system_messages(self) -> list[dict[str, str]]:
         model_s = self._resolved_model or self._config.model or "local"
-        return [
-            {
-                "role": "system",
-                "content": (
-                    f"Ты локальная языковая модель «{model_s}», запущенная через LM Studio на этом компьютере. "
-                    "Это не GigaChat и не облачный ChatGPT. "
-                    "Отвечай по существу на вопросы пользователя на том языке, на котором он пишет. "
-                    "Не отказывайся от обычных информационных вопросов."
-                ),
-            }
-        ]
+        content = render_local_system_message(
+            model_s, self._prompt.local_system_text
+        )
+        return [{"role": "system", "content": content}]
 
     def backend_status_line(self) -> str:
         if self._config.backend == "local":
@@ -1581,7 +1707,11 @@ class LLMAgent:
 
     def _persist_history(self) -> None:
         try:
-            save_unified_state(self._history_path, self._state)
+            save_unified_state(
+                self._history_path,
+                self._state,
+                message_window=self._generation.recent_message_window,
+            )
         except OSError:
             pass
         self._sync_short_term_memory()
@@ -1632,12 +1762,21 @@ class LLMAgent:
         out.extend(self._user_profile.build_system_messages())
         out.extend(self._memory.build_memory_system_messages())
         s = self._state.strategy
+        win = self._generation.recent_message_window
         if s == ContextStrategyKind.SLIDING_WINDOW:
-            out.extend(build_sliding_api_messages(self._state.messages))
+            out.extend(
+                build_sliding_api_messages(
+                    self._state.messages, message_window=win
+                )
+            )
             return _merge_leading_system_messages(out)
         if s == ContextStrategyKind.STICKY_FACTS:
             out.extend(
-                build_sticky_facts_api_messages(self._state.facts, self._state.messages)
+                build_sticky_facts_api_messages(
+                    self._state.facts,
+                    self._state.messages,
+                    message_window=win,
+                )
             )
             return _merge_leading_system_messages(out)
         out.extend(build_branching_api_messages(self._state))
@@ -1654,6 +1793,7 @@ class LLMAgent:
             "messages": list(messages),
             "stream": False,
         }
+        self._generation.apply_to_payload(payload)
         body = json.dumps(payload).encode("utf-8")
         url = self._chat_completions_url()
         req = urllib.request.Request(
@@ -1846,10 +1986,13 @@ class LLMAgent:
             ContextStrategyKind.SLIDING_WINDOW,
             ContextStrategyKind.STICKY_FACTS,
         ):
-            trim_messages(self._state.messages, RECENT_MESSAGE_WINDOW)
+            trim_messages(
+                self._state.messages, self._generation.recent_message_window
+            )
 
         if self._state.strategy == ContextStrategyKind.STICKY_FACTS:
             try:
+                win = self._generation.recent_message_window
 
                 def _complete_facts(msgs: list[dict[str, str]]) -> str:
                     r, _ = self._complete_chat(access_token, model, msgs)
@@ -1860,6 +2003,7 @@ class LLMAgent:
                     self._state.facts,
                     self._state.messages,
                     text,
+                    message_window=win,
                 )
             except (
                 OSError,
@@ -1898,6 +2042,7 @@ class LLMAgent:
                     idx,
                     top_k=self._rag_top_k,
                     config=self._rag_retrieval_config,
+                    rag_template=self._prompt.rag_template_text,
                 )
                 api_user_content = rag_aug.prompt
                 _cids: list[str] = []
@@ -1979,7 +2124,9 @@ class LLMAgent:
             ContextStrategyKind.SLIDING_WINDOW,
             ContextStrategyKind.STICKY_FACTS,
         ):
-            trim_messages(self._state.messages, RECENT_MESSAGE_WINDOW)
+            trim_messages(
+                self._state.messages, self._generation.recent_message_window
+            )
 
         self._trim_branching_after_split()
         self._persist_history()

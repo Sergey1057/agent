@@ -13,6 +13,8 @@ import time
 
 from agent import LLMAgent, RunResult, clear_history_file
 from context_strategies import ContextStrategyKind
+from generation_config import handle_gen_slash_command
+from prompt_templates import handle_prompt_slash_command
 from document_index.rag import default_rag_index_path
 from user_profile import parse_profile_set_rest
 
@@ -115,9 +117,19 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             "  /pipeline <query> [| file_path] — MCP-цепочка search -> summorize -> saveToFile\n"
             "  /rag [on|off|top N] [путь_к_index.json] — RAG: выдержки из индекса в запрос к LLM\n"
             "  /backend [cloud|local [model_id]] — облако (GigaChat) или локально (LM Studio)\n"
+            + LLMAgent.generation_help_block()
+            + "\n"
+            + LLMAgent.prompt_help_block()
+            + "\n"
             "  Запуск полностью локального RAG: python cli.py --local-rag\n"
             "  /help — эта справка"
         )
+
+    if cmd in ("/gen", "/generation", "/params"):
+        return handle_gen_slash_command(agent, arg)
+
+    if cmd in ("/prompt", "/prompts"):
+        return handle_prompt_slash_command(agent, arg)
 
     if cmd == "/backend":
         if not arg:
@@ -139,9 +151,18 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             agent.set_backend(sub, local_model=model_id)
         except ValueError as e:
             return str(e)
+        extra = ""
+        if sub in ("local", "lmstudio", "lm-studio"):
+            extra = "\n" + "\n".join(agent.prompt_status_lines())
+            if "встроенный по умолчанию" in extra:
+                extra += (
+                    f"\nПодсказка: отредактируйте memory/prompts/local_system.txt "
+                    f"и выполните /prompt local reload"
+                )
         return (
             f"Переключено. {agent.backend_status_line()}\n"
             "История диалога сброшена (чтобы не тянуть отказы/контекст GigaChat)."
+            f"{extra}"
         )
 
     if cmd == "/strategy":
@@ -704,6 +725,39 @@ def main() -> None:
         ),
     )
     p.add_argument(
+        "--temperature",
+        type=float,
+        default=None,
+        help="Temperature для chat/completions (0.0–2.0; иначе LLM_AGENT_TEMPERATURE)",
+    )
+    p.add_argument(
+        "--max-tokens",
+        type=int,
+        default=None,
+        dest="max_tokens",
+        help="Лимит токенов ответа (иначе LLM_AGENT_MAX_TOKENS)",
+    )
+    p.add_argument(
+        "--context-window",
+        type=int,
+        default=None,
+        dest="context_window",
+        help=(
+            "Сколько последних реплик user/assistant в промпте (1–500; "
+            "иначе LLM_AGENT_CONTEXT_WINDOW / LLM_AGENT_RECENT_MESSAGES)"
+        ),
+    )
+    p.add_argument(
+        "--rag-prompt-file",
+        default="",
+        help="Файл шаблона RAG user-message (плейсхолдеры {{CONTEXT_RULES}}, {{EXCERPTS}}, {{QUESTION}})",
+    )
+    p.add_argument(
+        "--local-prompt-file",
+        default="",
+        help="Файл system-промпта для backend=local (плейсхолдер {{MODEL}})",
+    )
+    p.add_argument(
         "--backend",
         choices=["cloud", "local"],
         default=None,
@@ -870,6 +924,11 @@ def main() -> None:
             backend=args.backend or ("local" if args.local_rag else None),
             local_model=args.local_model.strip() or None,
             local_url=args.local_url.strip() or None,
+            temperature=args.temperature,
+            max_tokens=args.max_tokens,
+            context_window=args.context_window,
+            rag_prompt_file=args.rag_prompt_file.strip() or None,
+            local_prompt_file=args.local_prompt_file.strip() or None,
         )
         return
 
@@ -888,6 +947,11 @@ def main() -> None:
         rag_enabled=rag_kw,
         rag_index_path=rag_index_kw,
         rag_top_k=args.rag_top_k,
+        temperature=args.temperature,
+        max_tokens=args.max_tokens,
+        context_window=args.context_window,
+        rag_prompt_file=args.rag_prompt_file.strip() or None,
+        local_prompt_file=args.local_prompt_file.strip() or None,
     )
 
     if args.github_repo:
@@ -963,9 +1027,12 @@ def main() -> None:
     print(
         "Пустая строка — выход. Ctrl+D — выход.\n"
         f"{agent.backend_status_line()}\n"
+        f"{agent.generation_status_line()}\n"
+        + "\n".join(agent.prompt_status_lines())
+        + "\n"
         f"{agent.branching_status_line()}\n"
         f"{agent.rag_status_line()}\n"
-        "Команды: /help, /backend cloud|local, /rag on|off\n"
+        "Команды: /help, /backend cloud|local, /rag on|off, /gen, /prompt\n"
         + (
             "Режим: полностью локальный RAG (LM Studio + memory/index_out).\n"
             if args.local_rag

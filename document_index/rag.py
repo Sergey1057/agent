@@ -734,54 +734,29 @@ def search_top_chunks(
     ).hits
 
 
-def build_rag_grounded_user_message(question: str, outcome: RagRetrievalOutcome) -> str:
-    """
-    User-сообщение для chat completion: правила формата (ответ / источники / цитаты) + выдержки
-    или режим «недостаточный контекст» без текста документов.
-    """
-    q = (question or "").strip()
-    lines: list[str] = [
-        "Ты ассистент с доступом только к приведённым ниже выдержкам из документов (RAG).",
-        "",
-        "ФОРМАТ ОТВЕТА (обязательно, три раздела с заголовками ровно в таком виде):",
-        "### Ответ",
-        "<содержательный ответ>",
-        "### Источники",
-        "<список строк: источник (имя файла) | раздел: … | chunk_id: … — только для выдержек, на которые опирался ответ>",
-        "### Цитаты",
-        "Каждая цитата — отдельная строка, начинается с «>», затем опционально [chunk_id] и дословный фрагмент из выдержки с этим chunk_id (до ~500 символов).",
-        "",
-        "Анти-галлюцинации:",
-        "- Любой факт из раздела «### Ответ» должен иметь опору в «### Цитаты»; цитата — копия текста из выдержки с тем же chunk_id.",
-        "- Нельзя выдумывать chunk_id, источники и цитаты: только из списка выдержек ниже.",
-        "- Нельзя дополнять ответ знаниями вне выдержек, если контекст помечен как достаточный.",
-        "",
-    ]
-
+def format_rag_context_rules(outcome: RagRetrievalOutcome) -> str:
+    """Блок правил для слабого или сильного контекста (плейсхолдер {{CONTEXT_RULES}})."""
     if not outcome.context_sufficient:
-        lines.extend(
-            [
-                "СТАТУС КОНТЕКСТА: релевантность найденных фрагментов запросу ниже внутреннего порога "
-                "(или совпадений по запросу не найдено). Тексты документов намеренно НЕ приводятся.",
-                "",
-                "Обязательное поведение:",
-                "- В «### Ответ» прямо напиши, что по имеющимся документам ты **не знаешь** надёжного ответа; "
-                "попроси пользователя уточнить вопрос, указать тему или фрагмент документа.",
-                "- В «### Источники» укажи одну строку вида: нет надёжных источников — релевантность ниже порога.",
-                "- В «### Цитаты» укажи: нет — цитировать нечего (контекст недостаточен).",
-                "- Не выдумывай содержание документов и не заполняй ответ общеизвестными фактами вместо документов.",
-                "",
-            ]
+        return (
+            "СТАТУС КОНТЕКСТА: релевантность найденных фрагментов запросу ниже внутреннего порога "
+            "(или совпадений по запросу не найдено). Тексты документов намеренно НЕ приводятся.\n"
+            "\n"
+            "Обязательное поведение:\n"
+            "- В «### Ответ» прямо напиши, что по имеющимся документам ты **не знаешь** надёжного ответа; "
+            "попроси пользователя уточнить вопрос, указать тему или фрагмент документа.\n"
+            "- В «### Источники» укажи одну строку вида: нет надёжных источников — релевантность ниже порога.\n"
+            "- В «### Цитаты» укажи: нет — цитировать нечего (контекст недостаточен).\n"
+            "- Не выдумывай содержание документов и не заполняй ответ общеизвестными фактами вместо документов."
         )
-    else:
-        lines.extend(
-            [
-                "Ниже — выдержки. Ответ строится **только** на них.",
-                "",
-            ]
-        )
+    return "Ниже — выдержки. Ответ строится **только** на них."
 
-    if outcome.context_sufficient and outcome.hits:
+
+def format_rag_excerpts_block(outcome: RagRetrievalOutcome) -> str:
+    """Тексты чанков для плейсхолдера {{EXCERPTS}}."""
+    if not outcome.context_sufficient:
+        return ""
+    lines: list[str] = []
+    if outcome.hits:
         for i, h in enumerate(outcome.hits, start=1):
             meta = _hit_meta_dict(h)
             section, cid = (
@@ -811,13 +786,28 @@ def build_rag_grounded_user_message(question: str, outcome: RagRetrievalOutcome)
             lines.append(head)
             lines.append(str(h.get("text") or "").strip())
             lines.append("")
-    elif outcome.context_sufficient and not outcome.hits:
+    else:
         lines.append("(Индекс не содержит чанков.)")
         lines.append("")
-
-    lines.append("--- Вопрос пользователя")
-    lines.append(q)
     return "\n".join(lines).strip()
+
+
+def build_rag_grounded_user_message(
+    question: str,
+    outcome: RagRetrievalOutcome,
+    *,
+    template: str | None = None,
+) -> str:
+    """
+    User-сообщение для chat completion: правила формата (ответ / источники / цитаты) + выдержки
+    или режим «недостаточный контекст» без текста документов.
+
+    template — свой текст с плейсхолдерами {{CONTEXT_RULES}}, {{EXCERPTS}}, {{QUESTION}}
+    (см. prompt_templates.DEFAULT_RAG_USER_TEMPLATE).
+    """
+    from prompt_templates import render_rag_user_prompt
+
+    return render_rag_user_prompt(question, outcome, template=template)
 
 
 def merge_question_with_chunks(question: str, hits: list[dict[str, Any]]) -> str:
@@ -944,6 +934,7 @@ def augment_user_message_with_rag(
     top_k: int = 5,
     dummy_embeddings: bool | None = None,
     config: RagRetrievalConfig | None = None,
+    rag_template: str | None = None,
 ) -> RagAugmentResult:
     """
     Вопрос → поиск чанков → объединение с вопросом.
@@ -957,7 +948,7 @@ def augment_user_message_with_rag(
         dummy_embeddings=dummy_embeddings,
         config=config,
     )
-    prompt = build_rag_grounded_user_message(question, out)
+    prompt = build_rag_grounded_user_message(question, out, template=rag_template)
     return RagAugmentResult(
         prompt=prompt,
         hits=out.hits,

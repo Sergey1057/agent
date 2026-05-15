@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from agent import LLMAgent, RunResult
+from generation_config import handle_gen_slash_command
+from prompt_templates import handle_prompt_slash_command
 from context_strategies import ContextStrategyKind
 from document_index.rag import default_rag_index_path, parse_rag_grounding_sections, resolve_rag_index_path
 from task_memory import DialogTaskMemory, parse_task_memory_json_from_reply
@@ -101,6 +103,11 @@ def run_rag_mini_chat_interactive(
     backend: str | None = None,
     local_model: str | None = None,
     local_url: str | None = None,
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+    context_window: int | None = None,
+    rag_prompt_file: str | Path | None = None,
+    local_prompt_file: str | Path | None = None,
 ) -> None:
     idx_raw = rag_index
     if idx_raw is None or str(idx_raw).strip() == "":
@@ -133,6 +140,11 @@ def run_rag_mini_chat_interactive(
         rag_index_path=idx,
         rag_top_k=rag_top_k,
         task_memory_path=task_p,
+        temperature=temperature,
+        max_tokens=max_tokens,
+        context_window=context_window,
+        rag_prompt_file=rag_prompt_file,
+        local_prompt_file=local_prompt_file,
     )
     agent.set_rag(True, index_path=idx)
 
@@ -141,10 +153,13 @@ def run_rag_mini_chat_interactive(
         f"История: {hist}\n"
         f"Память задачи: {task_p}\n"
         f"{agent.backend_status_line()}\n"
+        f"{agent.generation_status_line()}\n"
+        + "\n".join(agent.prompt_status_lines())
+        + "\n"
         f"{agent.rag_status_line()}\n"
         "Маркеры в сообщении пользователя:\n"
         "  ЦЕЛЬ: …  |  УТОЧНЕНИЕ: …  |  ТЕРМИН: ключ = значение\n"
-        "Команды: /taskmem show | /taskmem clear\n"
+        "Команды: /taskmem show | /taskmem clear | /gen … | /prompt …\n"
     )
     while True:
         try:
@@ -153,6 +168,18 @@ def run_rag_mini_chat_interactive(
             break
         if user == "":
             break
+        if user.strip().startswith("/"):
+            ucmd = user.strip().split(maxsplit=1)[0].lower()
+            if ucmd in ("/gen", "/generation", "/params"):
+                arg = user.strip()[len(ucmd) :].strip()
+                print(handle_gen_slash_command(agent, arg))
+                print()
+                continue
+            if ucmd in ("/prompt", "/prompts"):
+                arg = user.strip()[len(ucmd) :].strip()
+                print(handle_prompt_slash_command(agent, arg))
+                print()
+                continue
         ulow = user.strip().lower()
         if ulow in ("/taskmem show", "/taskmem", "/memory-task"):
             m = agent.dialog_task_memory
