@@ -1825,6 +1825,81 @@ class LLMAgent:
             reply = raw[:2000].strip()
         return reply, response_json
 
+    def fetch_models_json(self) -> dict[str, Any]:
+        """GET /v1/models — список моделей бэкенда (для HTTP-сервиса и диагностики)."""
+        access_token, auth_err = self._resolve_access_token()
+        if auth_err is not None:
+            raise RuntimeError(auth_err.text)
+        assert access_token is not None
+        url = self._models_url()
+        req = urllib.request.Request(
+            url, headers=self._bearer_headers(access_token), method="GET"
+        )
+        ctx = _ssl_context_for_url(url)
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            data: dict[str, Any] = json.loads(resp.read().decode())
+        return data
+
+    def complete_messages_stateless(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> tuple[str, dict[str, Any]]:
+        """
+        Stateless POST chat/completions: без истории файла агента.
+        temperature/max_tokens — только для этого вызова (не меняют self._generation).
+        """
+        access_token, auth_err = self._resolve_access_token()
+        if auth_err is not None:
+            raise RuntimeError(auth_err.text)
+        assert access_token is not None
+        resolved = model or self._ensure_model(access_token)
+        payload: dict[str, Any] = {
+            "model": resolved,
+            "messages": list(messages),
+            "stream": False,
+        }
+        gen_backup = replace(self._generation)
+        try:
+            if temperature is not None:
+                self._generation = replace(self._generation, temperature=temperature)
+            if max_tokens is not None:
+                self._generation = replace(self._generation, max_tokens=max_tokens)
+            self._generation.apply_to_payload(payload)
+            body = json.dumps(payload).encode("utf-8")
+            url = self._chat_completions_url()
+            req = urllib.request.Request(
+                url,
+                data=body,
+                headers=self._bearer_headers(access_token),
+                method="POST",
+            )
+            ctx = _ssl_context_for_url(url)
+            with urllib.request.urlopen(
+                req, timeout=self._config.timeout_sec, context=ctx
+            ) as resp:
+                raw = resp.read().decode("utf-8")
+            response_json: dict[str, Any] = json.loads(raw)
+        finally:
+            self._generation = gen_backup
+        choice = (response_json.get("choices") or [{}])[0]
+        msg = choice.get("message") or {}
+        content = msg.get("content")
+        if isinstance(content, str):
+            reply = content.strip()
+        elif content is not None:
+            reply = str(content).strip()
+        else:
+            reply = ""
+        if not reply:
+            reasoning = msg.get("reasoning_content")
+            if isinstance(reasoning, str) and reasoning.strip():
+                reply = reasoning.strip()
+        return reply, response_json
+
     def _chat_completions_url(self) -> str:
         return f"{self._config.api_base}/chat/completions"
 

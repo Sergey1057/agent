@@ -8,4 +8,5 @@ venv/
 .DS_Store
 chat_history.json
 chat_history.json.tmp
+memory/service_sessions/
 

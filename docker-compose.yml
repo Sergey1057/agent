@@ -1,0 +1,32 @@
+# Приватный API поверх локальной LLM на хосте (LM Studio / Ollama).
+# Перед запуском: на хосте должен работать inference на порту 1234 или 11434.
+#
+#   cp .env.example .env
+#   # отредактируйте LLM_SERVICE_API_KEY и LLM_AGENT_LOCAL_BASE_URL
+#   docker compose up -d --build
+#
+# Проверка с хоста:
+#   curl -s http://127.0.0.1:8080/health
+#   curl -s -H "Authorization: Bearer $LLM_SERVICE_API_KEY" \
+#     -H "Content-Type: application/json" \
+#     -d '{"message":"Привет"}' http://127.0.0.1:8080/api/chat
+
+services:
+  private-llm-api:
+    build: .
+    ports:
+      - "${LLM_SERVICE_PORT:-8080}:8080"
+    env_file:
+      - .env
+    environment:
+      LLM_AGENT_BACKEND: local
+      LLM_AGENT_LOCAL_BASE_URL: ${LLM_AGENT_LOCAL_BASE_URL:-http://host.docker.internal:1234/v1}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s

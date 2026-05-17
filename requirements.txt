@@ -4,3 +4,7 @@ truststore>=0.9.0
 mcp>=1.27.0
 # Семантические эмбеддинги для `python -m document_index` (без OPENAI_API_KEY)
 sentence-transformers>=3.0.0
+# Приватный HTTP-сервис: python -m llm_service
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+httpx>=0.27.0
