@@ -95,6 +95,10 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
         arg = "show"
 
     if cmd in ("/help", "/?"):
+        if arg:
+            from dev_assistant import answer_project_help
+
+            return answer_project_help(agent, arg)
         return (
             "Команды:\n"
             "  /strategy [sliding_window|sticky_facts|branching] — текущая или смена стратегии\n"
@@ -122,7 +126,10 @@ def _handle_slash_command(agent: LLMAgent, line: str) -> str | None:
             + LLMAgent.prompt_help_block()
             + "\n"
             "  Запуск полностью локального RAG: python cli.py --local-rag\n"
-            "  /help — эта справка"
+            "  /help — эта справка\n"
+            "  /help <вопрос о проекте> — ассистент разработчика (RAG docs + git через MCP)\n"
+            "  Пример: /help какая структура пакета aiadvent1?\n"
+            "  Индекс: python -m dev_assistant --build-index  |  --dev-assistant при запуске cli"
         )
 
     if cmd in ("/gen", "/generation", "/params"):
@@ -824,6 +831,19 @@ def main() -> None:
         help="Запустить policy-роутер MCP по текстовому запросу",
     )
     p.add_argument(
+        "--dev-assistant",
+        action="store_true",
+        help=(
+            "Ассистент разработчика: RAG по README/docs целевого проекта "
+            "(LLM_AGENT_PROJECT_ROOT) и MCP git"
+        ),
+    )
+    p.add_argument(
+        "--project-root",
+        default="",
+        help="Корень документируемого проекта (LLM_AGENT_PROJECT_ROOT)",
+    )
+    p.add_argument(
         "--local-rag",
         action="store_true",
         help=(
@@ -891,6 +911,22 @@ def main() -> None:
     args = p.parse_args()
     if args.reset_history:
         clear_history_file()
+
+    if args.project_root.strip():
+        os.environ["LLM_AGENT_PROJECT_ROOT"] = args.project_root.strip()
+
+    if args.dev_assistant:
+        from dev_assistant import default_project_index_path
+
+        os.environ.setdefault("LLM_AGENT_RAG", "1")
+        os.environ.setdefault("LLM_AGENT_RAG_LOCAL", "1")
+        idx = default_project_index_path()
+        if idx.is_file() and not args.rag_index.strip():
+            args.rag_index = str(idx)
+        if not args.rag:
+            args.rag = True
+        if args.backend is None:
+            args.backend = "local"
 
     if args.local_rag:
         os.environ.setdefault("LLM_AGENT_RAG", "1")
@@ -1032,11 +1068,15 @@ def main() -> None:
         + "\n"
         f"{agent.branching_status_line()}\n"
         f"{agent.rag_status_line()}\n"
-        "Команды: /help, /backend cloud|local, /rag on|off, /gen, /prompt\n"
+        "Команды: /help, /help <вопрос>, /backend cloud|local, /rag on|off, /gen, /prompt\n"
         + (
-            "Режим: полностью локальный RAG (LM Studio + memory/index_out).\n"
-            if args.local_rag
-            else ""
+            "Режим: ассистент разработчика (docs + git MCP). /help <вопрос> — о проекте.\n"
+            if args.dev_assistant
+            else (
+                "Режим: полностью локальный RAG (LM Studio + memory/index_out).\n"
+                if args.local_rag
+                else ""
+            )
         )
     )
     while True:

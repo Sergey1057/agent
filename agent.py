@@ -61,8 +61,12 @@ _AGENT_DIR = Path(__file__).resolve().parent
 _MCP_SERVER_SCRIPTS: dict[str, Path] = {
     "github": (_AGENT_DIR / "github_mcp_server.py").resolve(),
     "scheduler": (_AGENT_DIR / "scheduler_mcp_server.py").resolve(),
+    "project": (_AGENT_DIR / "project_mcp_server.py").resolve(),
 }
 _MCP_TOOL_ROUTES: dict[str, str] = {
+    "project_git_branch": "project",
+    "project_git_list_files": "project",
+    "project_git_diff": "project",
     "github_get_repo": "github",
     "search": "scheduler",
     "summorize": "scheduler",
@@ -1343,6 +1347,48 @@ class LLMAgent:
                 "repo": repo,
                 "include_readme": include_readme,
             },
+        )
+
+    def fetch_project_git_branch_via_mcp(self, repo_path: str) -> dict[str, Any]:
+        """Текущая git-ветка и краткий статус локального проекта (MCP project)."""
+        return self._call_mcp_tool(
+            "project_git_branch",
+            {"repo_path": repo_path},
+            server_name="project",
+        )
+
+    def fetch_project_list_files_via_mcp(
+        self,
+        repo_path: str,
+        *,
+        subpath: str = "",
+        max_files: int = 80,
+    ) -> dict[str, Any]:
+        return self._call_mcp_tool(
+            "project_git_list_files",
+            {
+                "repo_path": repo_path,
+                "subpath": subpath,
+                "max_files": int(max_files),
+            },
+            server_name="project",
+        )
+
+    def fetch_project_git_diff_via_mcp(
+        self,
+        repo_path: str,
+        *,
+        staged: bool = False,
+        max_lines: int = 200,
+    ) -> dict[str, Any]:
+        return self._call_mcp_tool(
+            "project_git_diff",
+            {
+                "repo_path": repo_path,
+                "staged": bool(staged),
+                "max_lines": int(max_lines),
+            },
+            server_name="project",
         )
 
     def _call_scheduler_tool_via_mcp(

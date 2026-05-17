@@ -44,7 +44,53 @@ def main() -> int:
         action="store_true",
         help="Детерминированные векторы без API/HF (только проверка формата индекса)",
     )
+    p.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="Корень Android/другого проекта: README + docs/ → единый индекс",
+    )
+    p.add_argument(
+        "--build-project-index",
+        action="store_true",
+        help="Собрать memory/index_out/project_docs_index.json из --project-root",
+    )
+    p.add_argument(
+        "--project-index-out",
+        type=Path,
+        default=Path("memory/index_out/project_docs_index.json"),
+        help="Выходной JSON при --build-project-index",
+    )
     args = p.parse_args()
+
+    if args.build_project_index:
+        from dev_assistant import default_project_root
+
+        from document_index.corpus import collect_corpus_paths, build_index_for_corpus
+
+        root = (args.project_root or default_project_root()).resolve()
+        paths = collect_corpus_paths(root)
+        if not paths:
+            print(f"Документация не найдена в {root}", file=sys.stderr)
+            return 1
+        print(f"Корень проекта: {root}")
+        print(f"Файлов в корпусе: {len(paths)}")
+        for pth in paths:
+            print(f"  - {pth}")
+        out = args.project_index_out.resolve()
+        try:
+            build_index_for_corpus(
+                paths,
+                strategy="structure",
+                out_path=out,
+                project_root=root,
+                dummy_embeddings=args.dummy_embeddings,
+            )
+        except RuntimeError as e:
+            print(str(e), file=sys.stderr)
+            return 1
+        print(f"Индекс проекта: {out}")
+        return 0
     inp = args.input.resolve()
     if not inp.is_file():
         print(f"Файл не найден: {inp}", file=sys.stderr)
